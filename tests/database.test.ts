@@ -398,4 +398,101 @@ describe('JsonFileDatabase', () => {
       })
     ).rejects.toThrow(/must be a number/);
   });
+
+  test('join resolves relations with batching and projection', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    const author = await db.insert('users', { name: 'Ada', role: 'author' });
+    const reviewer = await db.insert('users', { name: 'Bob', role: 'reviewer' });
+    const extra = await db.insert('users', { name: 'Carol', role: 'reviewer' });
+
+    const post = await db.insert('posts', {
+      title: 'Hello',
+      authorId: author._id,
+      reviewerIds: [reviewer._id, extra._id, 'missing-id']
+    });
+
+    const joined = await db.join('posts', post, {
+      author: {
+        localField: 'authorId',
+        foreignCollection: 'users',
+        projection: ['name']
+      },
+      reviewers: {
+        localField: 'reviewerIds',
+        foreignCollection: 'users',
+        many: true,
+        projection: ['name', 'role']
+      }
+    });
+
+    expect(joined.title).toBe('Hello');
+    expect(joined.author).toEqual({ _id: author._id, name: 'Ada' });
+    expect(Array.isArray(joined.reviewers)).toBe(true);
+    expect((joined.reviewers as unknown[])?.length).toBe(2);
+    expect((joined.reviewers as Record<string, unknown>[])[0]).toMatchObject({
+      _id: reviewer._id,
+      name: 'Bob',
+      role: 'reviewer'
+    });
+  });
+
+  test('join returns null/empty when relations are missing', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    const post = await db.insert('posts', { title: 'Lonely' });
+    const joined = await db.join('posts', post, {
+      author: { localField: 'authorId', foreignCollection: 'users' },
+      tags: { localField: 'tagIds', foreignCollection: 'tags', many: true }
+    });
+
+    expect(joined.author).toBeNull();
+    expect(joined.tags).toEqual([]);
+  });
+
+  test('join cache clears after writes so subsequent joins see updates', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    const user = await db.insert('users', { name: 'Ada' });
+    const post = await db.insert('posts', { authorId: user._id });
+
+    const firstJoin = await db.join('posts', post, {
+      author: { localField: 'authorId', foreignCollection: 'users', projection: ['name'] }
+    });
+    expect(firstJoin.author).toEqual({ _id: user._id, name: 'Ada' });
+
+    await db.update('users', user._id as string, { name: 'Ada Lovelace' });
+
+    const secondJoin = await db.join('posts', post, {
+      author: { localField: 'authorId', foreignCollection: 'users', projection: ['name'] }
+    });
+    expect(secondJoin.author).toEqual({ _id: user._id, name: 'Ada Lovelace' });
+  });
+
+  test('join projections support nested fields', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    const user = await db.insert('users', {
+      name: 'Ada',
+      profile: { city: 'London', employer: { name: 'Analytical Engine' } }
+    });
+    const post = await db.insert('posts', { authorId: user._id });
+
+    const joined = await db.join('posts', post, {
+      author: {
+        localField: 'authorId',
+        foreignCollection: 'users',
+        projection: ['profile.city', 'profile.employer.name']
+      }
+    });
+
+    expect(joined.author).toEqual({
+      _id: user._id,
+      profile: { city: 'London', employer: { name: 'Analytical Engine' } }
+    });
+  });
 });

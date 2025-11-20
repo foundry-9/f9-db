@@ -12,6 +12,7 @@ import type {
   IndexOptions,
   IndexMetadata,
   IndexStats,
+  JoinRelation,
   JoinRelations,
   Logger,
   NormalizedIndexOptions,
@@ -58,6 +59,8 @@ interface IndexFilePayload {
   entries: Record<string, DocumentId[]>;
 }
 
+const JOIN_CACHE_MAX_ENTRIES = 1000;
+
 const noopLogger: Logger = {
   debug: () => undefined,
   info: () => undefined,
@@ -70,6 +73,10 @@ class JsonFileDatabase implements Database {
   private collections = new Map<string, CollectionState>();
   private manifest: Manifest | null = null;
   private manifestPath: string;
+  private joinCache = new Map<
+    string,
+    Map<string, Map<string, Document | null>>
+  >();
 
   constructor(options: DatabaseOptions = {}) {
     this.options = resolveOptions(options);
@@ -95,6 +102,7 @@ class JsonFileDatabase implements Database {
     state.docs.set(_id, normalized);
     await this.appendLog(collection, state, { _id, data: normalized });
     await this.refreshIndexesForWrite(collection, state, normalized, null);
+    this.clearJoinCache();
     return cloneDocument(normalized);
   }
 
@@ -126,6 +134,7 @@ class JsonFileDatabase implements Database {
     state.docs.set(id, normalized);
     await this.appendLog(collection, state, { _id: id, data: normalized });
     await this.refreshIndexesForWrite(collection, state, normalized, existing);
+    this.clearJoinCache();
     return cloneDocument(normalized);
   }
 
@@ -140,6 +149,7 @@ class JsonFileDatabase implements Database {
     state.docs.delete(id);
     await this.appendLog(collection, state, { _id: id, tombstone: true });
     await this.refreshIndexesForWrite(collection, state, null, existing);
+    this.clearJoinCache();
   }
 
   async find(
@@ -286,13 +296,55 @@ class JsonFileDatabase implements Database {
     doc: Document,
     relations: JoinRelations
   ): Promise<Document> {
-    this.options.log?.warn?.('join is stubbed; returning original document', {
-      collection,
-      id: doc._id,
-      relations: Object.keys(relations ?? {})
+    if (!relations || Object.keys(relations).length === 0) {
+      return cloneDocument(doc);
+    }
+
+    const base = cloneDocument(doc);
+    const normalized = normalizeJoinRelations(base, relations);
+    if (normalized.length === 0) {
+      return base;
+    }
+
+    const fetchPlan = new Map<
+      string,
+      { collection: string; field: string; values: Set<DocumentId> }
+    >();
+
+    normalized.forEach((entry) => {
+      if (entry.values.length === 0) {
+        return;
+      }
+
+      const key = serializeJoinKey(entry.relation.foreignCollection, entry.relation.foreignField);
+      const existing =
+        fetchPlan.get(key) ??
+        {
+          collection: entry.relation.foreignCollection,
+          field: entry.relation.foreignField ?? '_id',
+          values: new Set<DocumentId>()
+        };
+      entry.values.forEach((value) => existing.values.add(value));
+      fetchPlan.set(key, existing);
     });
 
-    return cloneDocument(doc);
+    const fetched = new Map<string, Map<DocumentId, Document | null>>();
+    for (const plan of fetchPlan.values()) {
+      const key = serializeJoinKey(plan.collection, plan.field);
+      fetched.set(
+        key,
+        await this.fetchJoinTargets(plan.collection, plan.field, plan.values)
+      );
+    }
+
+    for (const entry of normalized) {
+      const key = serializeJoinKey(entry.relation.foreignCollection, entry.relation.foreignField);
+      const lookup = fetched.get(key) ?? new Map<DocumentId, Document | null>();
+      const projected = resolveProjection(entry, lookup);
+      setValueAtPath(base as Record<string, unknown>, entry.targetPath, projected);
+    }
+
+    return base;
   }
 
   async compact(collection: string): Promise<void> {
@@ -826,6 +878,103 @@ class JsonFileDatabase implements Database {
 
     return usedFields.length > 0 ? candidates ?? new Set<DocumentId>() : null;
   }
+
+  private getJoinCacheBucket(
+    collection: string,
+    field: string
+  ): Map<DocumentId, Document | null> {
+    let fields = this.joinCache.get(collection);
+    if (!fields) {
+      fields = new Map();
+      this.joinCache.set(collection, fields);
+    }
+
+    let bucket = fields.get(field);
+    if (!bucket) {
+      bucket = new Map();
+      fields.set(field, bucket);
+    }
+
+    return bucket;
+  }
+
+  private clearJoinCache(): void {
+    this.joinCache.clear();
+  }
+
+  private touchJoinCache(
+    bucket: Map<DocumentId, Document | null>,
+    id: DocumentId,
+    value: Document | null
+  ): void {
+    bucket.delete(id);
+    bucket.set(id, value);
+    this.trimJoinCacheBucket(bucket);
+  }
+
+  private trimJoinCacheBucket(bucket: Map<DocumentId, Document | null>): void {
+    while (bucket.size > JOIN_CACHE_MAX_ENTRIES) {
+      const oldest = bucket.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      bucket.delete(oldest as DocumentId);
+    }
+  }
+
+  private async fetchJoinTargets(
+    collection: string,
+    field: string,
+    values: Set<DocumentId>
+  ): Promise<Map<DocumentId, Document | null>> {
+    const cache = this.getJoinCacheBucket(collection, field);
+    const results = new Map<DocumentId, Document | null>();
+    const missing = new Set<DocumentId>();
+
+    values.forEach((value) => {
+      const cached = cache.get(value);
+      if (cached !== undefined) {
+        this.touchJoinCache(cache, value, cached);
+        results.set(value, cached ? cloneDocument(cached) : null);
+      } else {
+        missing.add(value);
+      }
+    });
+
+    if (missing.size === 0) {
+      return results;
+    }
+
+    const state = await this.loadCollection(collection);
+
+    if (field === '_id') {
+      missing.forEach((value) => {
+        const doc = state.docs.get(value) ?? null;
+        const cachedDoc = doc ? cloneDocument(doc) : null;
+        this.touchJoinCache(cache, value, cachedDoc);
+        results.set(value, cachedDoc ? cloneDocument(cachedDoc) : null);
+      });
+      return results;
+    }
+
+    const candidates = new Map<string, Document>();
+    for (const document of state.docs.values()) {
+      const candidateValue = (document as Record<string, unknown>)[field];
+      if (typeof candidateValue !== 'string' || !missing.has(candidateValue)) {
+        continue;
+      }
+      candidates.set(candidateValue, document);
+    }
+
+    missing.forEach((value) => {
+      const doc = candidates.get(value) ?? null;
+      const cachedDoc = doc ? cloneDocument(doc) : null;
+      this.touchJoinCache(cache, value, cachedDoc);
+      results.set(value, cachedDoc ? cloneDocument(cachedDoc) : null);
+    });
+
+    return results;
+  }
 }
 
 function resolveOptions(options: DatabaseOptions): ResolvedOptions {
@@ -846,6 +995,164 @@ function resolveOptions(options: DatabaseOptions): ResolvedOptions {
     snapshotInterval: options.snapshotInterval ?? 100,
     logRetention: options.logRetention ?? 'truncate'
   };
+}
+
+interface NormalizedJoin {
+  key: string;
+  relation: JoinRelation;
+  targetPath: string;
+  values: DocumentId[];
+  isMany: boolean;
+}
+
+function normalizeJoinRelations(
+  doc: Document,
+  relations: JoinRelations
+): NormalizedJoin[] {
+  const flattened: NormalizedJoin[] = [];
+  if (!relations) {
+    return flattened;
+  }
+
+  Object.entries(relations).forEach(([key, raw]) => {
+    const relationList = Array.isArray(raw) ? raw : [raw];
+
+    relationList.forEach((relation) => {
+      if (!relation?.localField || !relation.foreignCollection) {
+        return;
+      }
+
+      const localValue = getValueAtPath(
+        doc as Record<string, unknown>,
+        relation.localField
+      );
+      const isMany = resolveManyFlag(relation, localValue);
+      const values = extractJoinValues(localValue, isMany);
+      const foreignField = relation.foreignField ?? '_id';
+
+      flattened.push({
+        key,
+        relation: { ...relation, foreignField },
+        targetPath: relation.as ?? key ?? relation.localField,
+        values,
+        isMany
+      });
+    });
+  });
+
+  return flattened;
+}
+
+function resolveProjection(
+  entry: NormalizedJoin,
+  lookup: Map<DocumentId, Document | null>
+): Document | Document[] | null {
+  if (entry.isMany) {
+    const resolved = entry.values
+      .map((value) => lookup.get(value))
+      .filter((value): value is Document => !!value)
+      .map((value) => projectDocument(value, entry.relation.projection));
+    return resolved;
+  }
+
+  const value = entry.values[0];
+  if (!value) {
+    return null;
+  }
+  const found = lookup.get(value);
+  return found ? projectDocument(found, entry.relation.projection) : null;
+}
+
+function extractJoinValues(
+  localValue: unknown,
+  isMany: boolean
+): DocumentId[] {
+  if (isMany) {
+    if (!Array.isArray(localValue)) {
+      return [];
+    }
+    return localValue
+      .filter((value): value is DocumentId => typeof value === 'string')
+      .map((value) => value as DocumentId);
+  }
+
+  return typeof localValue === 'string' ? [localValue as DocumentId] : [];
+}
+
+function resolveManyFlag(relation: JoinRelation, localValue: unknown): boolean {
+  if (typeof relation.many === 'boolean') {
+    return relation.many;
+  }
+  return Array.isArray(localValue);
+}
+
+function serializeJoinKey(collection: string, field?: string): string {
+  return `${collection}::${field ?? '_id'}`;
+}
+
+function projectDocument(
+  doc: Document,
+  projection?: string[]
+): Document {
+  if (!projection || projection.length === 0) {
+    return cloneDocument(doc);
+  }
+
+  const projected: Document = {};
+  if (doc._id !== undefined) {
+    projected._id = doc._id;
+  }
+
+  const source = doc as Record<string, unknown>;
+  projection.forEach((fieldPath) => {
+    const value = getValueAtPath(source, fieldPath);
+    if (value === undefined) {
+      return;
+    }
+    setValueAtPath(
+      projected as Record<string, unknown>,
+      fieldPath,
+      cloneDocument(value) as unknown
+    );
+  });
+
+  return projected;
+}
+
+function getValueAtPath(
+  source: Record<string, unknown>,
+  path: string
+): unknown {
+  if (!path.includes('.')) {
+    return source[path];
+  }
+
+  return path.split('.').reduce<unknown>((current, segment) => {
+    if (!isPlainObject(current)) {
+      return undefined;
+    }
+    return (current as Record<string, unknown>)[segment];
+  }, source);
+}
+
+function setValueAtPath(
+  target: Record<string, unknown>,
+  path: string,
+  value: unknown
+): void {
+  const segments = path.split('.');
+  let cursor: Record<string, unknown> = target;
+
+  for (let idx = 0; idx < segments.length - 1; idx += 1) {
+    const segment = segments[idx] as string;
+    const next = cursor[segment];
+    if (!isPlainObject(next)) {
+      cursor[segment] = {};
+    }
+    cursor = cursor[segment] as Record<string, unknown>;
+  }
+
+  cursor[segments[segments.length - 1] as string] = value;
 }
 
 function resolveTokenizer(
