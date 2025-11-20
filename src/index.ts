@@ -50,6 +50,11 @@ interface Manifest {
   collections: Record<string, ManifestCollectionEntry | undefined>;
 }
 
+interface IndexFilePayload {
+  meta: IndexMetadata;
+  entries: Record<string, DocumentId[]>;
+}
+
 const noopLogger: Logger = {
   debug: () => undefined,
   info: () => undefined,
@@ -78,8 +83,10 @@ class JsonFileDatabase implements Database {
     }
 
     const stored: Document = { ...doc, _id };
+    await this.enforceUniqueConstraints(collection, stored, state, null);
     state.docs.set(_id, stored);
     await this.appendLog(collection, state, { _id, data: stored });
+    await this.refreshIndexesForWrite(collection, state, stored, null);
     return cloneDocument(stored);
   }
 
@@ -102,8 +109,10 @@ class JsonFileDatabase implements Database {
     }
 
     const updated: Document = { ...existing, ...mutation, _id: id };
+    await this.enforceUniqueConstraints(collection, updated, state, id);
     state.docs.set(id, updated);
     await this.appendLog(collection, state, { _id: id, data: updated });
+    await this.refreshIndexesForWrite(collection, state, updated, existing);
     return cloneDocument(updated);
   }
 
@@ -114,8 +123,10 @@ class JsonFileDatabase implements Database {
       throw new Error(`Document '${id}' not found in collection '${collection}'`);
     }
 
+    const existing = state.docs.get(id) ?? null;
     state.docs.delete(id);
     await this.appendLog(collection, state, { _id: id, tombstone: true });
+    await this.refreshIndexesForWrite(collection, state, null, existing);
   }
 
   async find(
@@ -127,9 +138,14 @@ class JsonFileDatabase implements Database {
     const { limit = Infinity, skip = 0, sort } = options;
     const sortKeys = sort ? Object.keys(sort) : [];
 
-    let results = Array.from(state.docs.values()).filter((doc) =>
-      matchesFilter(doc, filter)
-    );
+    const candidates = await this.getIndexedCandidates(collection, filter, state);
+    const docsToScan = candidates
+      ? Array.from(candidates)
+          .map((id) => state.docs.get(id))
+          .filter(Boolean) as Document[]
+      : Array.from(state.docs.values());
+
+    let results = docsToScan.filter((doc) => matchesFilter(doc, filter));
 
     if (sortKeys.length > 0) {
       results = results.sort((left, right) =>
@@ -148,9 +164,13 @@ class JsonFileDatabase implements Database {
     const state = await this.loadCollection(collection);
     const { limit = Infinity, skip = 0, sort } = options;
     const sortKeys = sort ? Object.keys(sort) : [];
-    let results = Array.from(state.docs.values()).filter((doc) =>
-      matchesFilter(doc, filter)
-    );
+    const candidates = await this.getIndexedCandidates(collection, filter, state);
+    const docsToScan = candidates
+      ? Array.from(candidates)
+          .map((id) => state.docs.get(id))
+          .filter(Boolean) as Document[]
+      : Array.from(state.docs.values());
+    let results = docsToScan.filter((doc) => matchesFilter(doc, filter));
 
     if (sortKeys.length > 0) {
       results = results.sort((left, right) =>
@@ -457,6 +477,34 @@ class JsonFileDatabase implements Database {
     return path.join(this.options.indexDir, collection, `${field}.json`);
   }
 
+  private async persistIndex(
+    collection: string,
+    field: string,
+    meta: IndexMetadata,
+    entries: Record<string, DocumentId[]>
+  ): Promise<IndexMetadata> {
+    await ensureIndexDirectory(meta.path);
+    await fsp.writeFile(
+      meta.path,
+      JSON.stringify({ meta, entries }, null, 2),
+      'utf8'
+    );
+
+    const sizeBytes = await getFileSize(meta.path);
+    const finalMeta: IndexMetadata = {
+      ...meta,
+      stats: meta.stats
+        ? { ...meta.stats, sizeBytes }
+        : { docCount: 0, tokenCount: 0, sizeBytes }
+    };
+
+    await this.updateManifest(collection, {
+      indexes: { [field]: finalMeta }
+    });
+
+    return finalMeta;
+  }
+
   private async buildIndex(
     collection: string,
     field: string,
@@ -484,24 +532,7 @@ class JsonFileDatabase implements Database {
           builtAt: now
         }
       };
-
-      const payload = {
-        meta: readyMeta,
-        entries
-      };
-
-      await ensureIndexDirectory(metadata.path);
-      await fsp.writeFile(metadata.path, JSON.stringify(payload, null, 2), 'utf8');
-
-      const sizeBytes = await getFileSize(metadata.path);
-      const finalMeta: IndexMetadata = {
-        ...readyMeta,
-        stats: { ...(readyMeta.stats as IndexStats), sizeBytes }
-      };
-
-      await this.updateManifest(collection, {
-        indexes: { [field]: finalMeta }
-      });
+      await this.persistIndex(collection, field, { ...readyMeta }, entries);
     } catch (error) {
       const failedMeta: IndexMetadata = {
         ...baseMeta,
@@ -515,6 +546,235 @@ class JsonFileDatabase implements Database {
 
       throw error;
     }
+  }
+
+  private async enforceUniqueConstraints(
+    collection: string,
+    doc: Document,
+    state: CollectionState,
+    existingId: DocumentId | null
+  ): Promise<void> {
+    const manifest = await this.getManifest();
+    const indexEntries = manifest.collections[collection]?.indexes ?? {};
+    const logSize = await getFileSize(state.logPath);
+
+    for (const [field, metadata] of Object.entries(indexEntries)) {
+      if (!metadata?.options.unique || metadata.state !== 'ready') {
+        continue;
+      }
+
+      if (metadata.checkpoint < logSize) {
+        this.options.log?.warn?.('Skipping unique check for stale index', {
+          collection,
+          field,
+          checkpoint: metadata.checkpoint,
+          logSize
+        });
+        continue;
+      }
+
+      const value = (doc as Record<string, unknown>)[field];
+      const tokens = collectTokens(value, metadata.options);
+      let enforcedThroughIndex = false;
+
+      if (tokens.length > 0) {
+        const indexFile = await loadIndexFile(metadata.path);
+        if (indexFile) {
+          enforcedThroughIndex = true;
+          const candidateIds = intersectPostingLists(indexFile.entries, tokens);
+          for (const candidateId of candidateIds) {
+            if (existingId && candidateId === existingId) {
+              continue;
+            }
+
+            const candidateDoc = state.docs.get(candidateId);
+            if (!candidateDoc) {
+              continue;
+            }
+
+            const candidateValue = (candidateDoc as Record<string, unknown>)[field];
+            if (isValueEqual(candidateValue, value)) {
+              throw new Error(
+                `Unique constraint violated for field '${field}' in collection '${collection}'`
+              );
+            }
+          }
+        }
+      }
+
+      if (!enforcedThroughIndex) {
+        for (const [candidateId, candidateDoc] of state.docs.entries()) {
+          if (existingId && candidateId === existingId) {
+            continue;
+          }
+
+          const candidateValue = (candidateDoc as Record<string, unknown>)[field];
+          if (isValueEqual(candidateValue, value)) {
+            throw new Error(
+              `Unique constraint violated for field '${field}' in collection '${collection}'`
+            );
+          }
+        }
+      }
+    }
+  }
+
+  private async markIndexStale(
+    collection: string,
+    field: string,
+    metadata: IndexMetadata,
+    lastError?: string
+  ): Promise<void> {
+    const stale: IndexMetadata = {
+      ...metadata,
+      state: 'stale',
+      lastError: lastError ?? metadata.lastError,
+      updatedAt: new Date().toISOString()
+    };
+
+    await this.updateManifest(collection, {
+      indexes: { [field]: stale }
+    });
+  }
+
+  private async refreshIndexesForWrite(
+    collection: string,
+    state: CollectionState,
+    newDoc: Document | null,
+    previousDoc: Document | null
+  ): Promise<void> {
+    const manifest = await this.getManifest();
+    const indexEntries = manifest.collections[collection]?.indexes ?? {};
+    if (Object.keys(indexEntries).length === 0) {
+      return;
+    }
+
+    const logCheckpoint = await getFileSize(state.logPath);
+    for (const [field, metadata] of Object.entries(indexEntries)) {
+      if (!metadata || metadata.state !== 'ready') {
+        continue;
+      }
+
+      const indexFile = await loadIndexFile(metadata.path);
+      if (!indexFile) {
+        await this.markIndexStale(collection, field, metadata, 'index file missing');
+        continue;
+      }
+
+      try {
+        const entries = { ...indexFile.entries };
+        const prevTokens = previousDoc
+          ? collectTokens(
+              (previousDoc as Record<string, unknown>)[field],
+              metadata.options
+            )
+          : [];
+        const nextTokens = newDoc
+          ? collectTokens((newDoc as Record<string, unknown>)[field], metadata.options)
+          : [];
+
+        const prevId = (previousDoc?._id ?? '') as DocumentId;
+        const nextId = (newDoc?._id ?? '') as DocumentId;
+
+        prevTokens.forEach((token) => removePostingId(entries, token, prevId));
+        nextTokens.forEach((token) => addPostingId(entries, token, nextId));
+
+        const stats: IndexStats = {
+          docCount: state.docs.size,
+          tokenCount: calculateTokenCount(entries),
+          builtAt: indexFile.meta.stats?.builtAt
+        };
+
+        const updatedMeta: IndexMetadata = {
+          ...metadata,
+          state: 'ready',
+          lastError: undefined,
+          checkpoint: logCheckpoint,
+          updatedAt: new Date().toISOString(),
+          stats: { ...stats }
+        };
+
+        await this.persistIndex(collection, field, updatedMeta, entries);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.options.log?.error?.('Failed to refresh index after write', {
+          collection,
+          field,
+          error: message
+        });
+        await this.markIndexStale(collection, field, metadata, message);
+      }
+    }
+  }
+
+  private async getIndexedCandidates(
+    collection: string,
+    filter: Filter,
+    state: CollectionState
+  ): Promise<Set<DocumentId> | null> {
+    const manifest = await this.getManifest();
+    const indexEntries = manifest.collections[collection]?.indexes ?? {};
+    const logSize = await getFileSize(state.logPath);
+    let candidates: Set<DocumentId> | null = null;
+    const usedFields: string[] = [];
+
+    for (const [field, expected] of Object.entries(filter)) {
+      if (expected === undefined) {
+        continue;
+      }
+
+      const metadata = indexEntries[field];
+      if (!metadata || metadata.state !== 'ready' || metadata.checkpoint < logSize) {
+        continue;
+      }
+
+      const indexFile = await loadIndexFile(metadata.path);
+      if (!indexFile) {
+        continue;
+      }
+
+      const expectedValues = Array.isArray(expected) ? expected : [expected];
+      const perValueCandidates: Set<DocumentId>[] = [];
+
+      for (const value of expectedValues) {
+        if (typeof value !== 'string' && !Array.isArray(value)) {
+          continue;
+        }
+
+        const tokens = collectTokens(value, metadata.options);
+        if (tokens.length === 0) {
+          continue;
+        }
+
+        perValueCandidates.push(intersectPostingLists(indexFile.entries, tokens));
+      }
+
+      if (perValueCandidates.length === 0) {
+        continue;
+      }
+
+      let fieldCandidates = perValueCandidates[0];
+      for (let idx = 1; idx < perValueCandidates.length; idx += 1) {
+        fieldCandidates = unionSets(fieldCandidates, perValueCandidates[idx]);
+      }
+
+      usedFields.push(field);
+      candidates = candidates ? intersectSets(candidates, fieldCandidates) : fieldCandidates;
+
+      if (candidates.size === 0) {
+        break;
+      }
+    }
+
+    if (usedFields.length > 0) {
+      this.options.log?.debug?.('Using index for query', {
+        collection,
+        fields: usedFields,
+        candidateCount: candidates?.size ?? 0
+      });
+    }
+
+    return usedFields.length > 0 ? candidates ?? new Set<DocumentId>() : null;
   }
 }
 
@@ -653,6 +913,108 @@ async function writeIndexStub(
 
   await ensureIndexDirectory(indexPath);
   await fsp.writeFile(indexPath, JSON.stringify(payload, null, 2), 'utf8');
+}
+
+async function loadIndexFile(indexPath: string): Promise<IndexFilePayload | null> {
+  try {
+    const raw = await fsp.readFile(indexPath, 'utf8');
+    const parsed = JSON.parse(raw) as IndexFilePayload;
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+    return parsed;
+  } catch (error) {
+    if (isEnoentError(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function intersectPostingLists(
+  entries: Record<string, DocumentId[]>,
+  tokens: string[]
+): Set<DocumentId> {
+  let result: Set<DocumentId> | null = null;
+
+  for (const token of tokens) {
+    const ids = entries[token];
+    if (!ids || ids.length === 0) {
+      return new Set();
+    }
+
+    const idSet = new Set(ids);
+    result = result ? intersectSets(result, idSet) : idSet;
+
+    if (result.size === 0) {
+      return result;
+    }
+  }
+
+  return result ?? new Set();
+}
+
+function unionSets<T>(left: Set<T>, right: Set<T>): Set<T> {
+  const union = new Set<T>(left);
+  right.forEach((value) => union.add(value));
+  return union;
+}
+
+function intersectSets<T>(left: Set<T>, right: Set<T>): Set<T> {
+  const intersect = new Set<T>();
+  left.forEach((value) => {
+    if (right.has(value)) {
+      intersect.add(value);
+    }
+  });
+  return intersect;
+}
+
+function addPostingId(entries: Record<string, DocumentId[]>, token: string, id: DocumentId): void {
+  const current = entries[token];
+  if (!current) {
+    entries[token] = [id];
+    return;
+  }
+
+  if (current.includes(id)) {
+    return;
+  }
+
+  current.push(id);
+  current.sort();
+}
+
+function removePostingId(
+  entries: Record<string, DocumentId[]>,
+  token: string,
+  id: DocumentId
+): void {
+  const current = entries[token];
+  if (!current) {
+    return;
+  }
+
+  const idx = current.indexOf(id);
+  if (idx === -1) {
+    return;
+  }
+
+  current.splice(idx, 1);
+  if (current.length === 0) {
+    delete entries[token];
+  }
+}
+
+function calculateTokenCount(entries: Record<string, DocumentId[]>): number {
+  return Object.values(entries).reduce((sum, ids) => sum + ids.length, 0);
+}
+
+function isValueEqual(left: unknown, right: unknown): boolean {
+  if (left === undefined || right === undefined) {
+    return left === right;
+  }
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function buildIndexEntries(

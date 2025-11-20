@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { afterEach, describe, expect, test } from '@jest/globals';
+import { afterEach, describe, expect, jest, test } from '@jest/globals';
 import { createDatabase } from '../src/index.js';
 import type { Database } from '../src/types.js';
 
@@ -286,5 +286,57 @@ describe('JsonFileDatabase', () => {
     const indexPath = path.join(dataDir, 'indexes', 'users', 'name.json');
     const indexFile = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
     expect(indexFile.entries.carol).toEqual([carol._id]);
+  });
+
+  test('find emits log when an index is used to satisfy a filter', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    const debug = jest.fn();
+    db = createDatabase({ dataDir, binaryDir, log: { debug } });
+
+    await db.insert('users', { name: 'Ada Lovelace' });
+    await db.insert('users', { name: 'Bob' });
+    await db.ensureIndex('users', 'name');
+
+    debug.mockClear();
+    const result = await db.find('users', { name: 'Ada Lovelace' });
+    expect(result).toHaveLength(1);
+
+    expect(debug).toHaveBeenCalledWith(
+      'Using index for query',
+      expect.objectContaining({
+        collection: 'users',
+        fields: expect.arrayContaining(['name']),
+        candidateCount: 1
+      })
+    );
+  });
+
+  test('unique indexes are enforced on insert, update, and remove', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    await db.ensureIndex('users', 'name', { unique: true });
+    const first = await db.insert('users', { name: 'Ada' });
+
+    await expect(db.insert('users', { name: 'Ada' })).rejects.toThrow(
+      /Unique constraint violated/
+    );
+
+    const second = await db.insert('users', { name: 'Bob' });
+    const third = await db.insert('users', { name: 'Carol' });
+
+    await expect(db.update('users', third._id as string, { name: 'Bob' })).rejects.toThrow(
+      /Unique constraint violated/
+    );
+
+    await db.remove('users', first._id as string);
+    const replacement = await db.insert('users', { name: 'Ada' });
+
+    const indexPath = path.join(dataDir, 'indexes', 'users', 'name.json');
+    const indexFile = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+    expect(indexFile.entries.ada).toEqual([replacement._id]);
+    expect(Object.values(indexFile.entries).flat().filter((id) => id === second._id)).toHaveLength(
+      1
+    );
   });
 });
