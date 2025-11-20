@@ -20,8 +20,8 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 
 - **Append-only logs** per collection: `data/<collection>.jsonl`.
 - **Snapshots**: `data/<collection>.snapshot.json` to compact logs and speed startup.
-- **Indexes**: `data/indexes/<collection>/<field>.json` inverted index (tokens → ids); incremental updates + rebuild hooks.
-- **Manifest**: `data/manifest.json` stores schemas/index definitions/checkpoints.
+- **Indexes**: `data/indexes/<collection>/<field>.json` inverted index (tokens → ids, lowercase + non-alpha split, min length 2, no stemming by default); incremental updates + rebuild hooks; used for unique enforcement.
+- **Manifest**: `data/manifest.json` stores rigid schemas, constraints, indexes, checkpoints, and manifest/schema versions.
 - **Binary store**: `binaries/<sha256>` with references in docs (e.g., `_binRefs`).
 - **Logs**: JSON logs in `logs/app.log` (rotated) or user-supplied logger.
 
@@ -33,6 +33,13 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 - Query: `find(collection, filter, opts)` (JSON result), `stream(collection, filter, opts)` (AsyncIterator yielding JSONL).
 - Index mgmt: `ensureIndex(collection, field, options)`, `rebuildIndex`.
 - Relations: `join(collection, doc, relations)` resolves foreign refs into nested objects/arrays with batching to avoid N+1.
+
+## Schema & Constraints
+- Rigid schema per collection/table; all fields declared up-front except one flexible `json` type for arbitrary payloads.
+- Types: string, number, boolean, date/iso-string, binary ref, arrays/objects with typed children (unless declared `json`).
+- Constraints: required/not-null, defaults, string min/max/regex/enum, number min/max/integer-only, array item type + length bounds, object nested validation.
+- Uniqueness: single or composite unique constraints enforced via indexes and manifest metadata.
+- Validation runs on insert/update; compaction re-validates and flags corrupt rows.
 
 ## Data & Query Behavior
 
@@ -57,6 +64,7 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 ## Binaries & Encryption (Quilltap Direction)
 
 - Binary blobs saved under `binaries/` with sha256 names; docs store references.
+- Deduplication on by default (sha256 hash); opt-out available.
 - Future Quilltap-facing extensions: transparent encryption at rest (local/S3), per-user key model, queued sync to S3 after local edits, and dual-key derivation for multi-user support.
 
 ## Configuration Highlights
@@ -64,9 +72,15 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 - Paths: `dataDir`, `binaryDir`, `logDir`
 - Compaction: `autoCompact`, `compactInterval`, `maxLogBytes`
 - Durability: `fsync` = `always | batch | never`
-- Index: tokenizer, prefix length, optional stopwords
+- Index: tokenizer (lowercase + non-alpha split, min length 2, no stemming by default), prefix length, optional stopwords, custom tokenizer hook
 - Limits: max doc size, max result size, stream chunk size
 - Serialization: custom `replacer`/`reviver`
+- Manifest/versioning: `manifestVersion` (start 1) and per-collection schema/index versioning
+- Dedup: `dedupeBinaries` default true (sha256), can disable
+
+## Locking & Concurrency Defaults
+- Single-writer lock via JS lockfile with retry/backoff for portability.
+- Optional `lockMode: "lockfile" | "flock"` flag; default is lockfile, `flock` opt-in when available.
 
 ## Testing Approach
 
@@ -77,8 +91,8 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 
 ## Roadmap
 
-- Decide locking mechanism (lockfile vs `flock`).
-- Finalize tokenizer defaults (stemming off by default).
-- Binary deduplication policy (default on via sha256).
+- Implement lockfile default with optional `flock` flag and document support matrix.
+- Expose tokenizer hook and config; ship sensible defaults (lowercase, non-alpha split, min length 2).
+- Ship `dedupeBinaries` toggle and metadata in manifest.
 - Add examples for Express middleware and Next.js route handlers.
 - Layer in S3-backed encrypted storage and per-user keys for Quilltap use cases.
