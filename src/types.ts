@@ -159,6 +159,8 @@ export interface DatabaseOptions {
   indexDir?: string;
   tokenizer?: Partial<TokenizerOptions>;
   schemas?: Record<string, CollectionSchema>;
+  joinCacheMaxEntries?: number;
+  joinCacheTTLms?: number;
 }
 
 export interface Database {

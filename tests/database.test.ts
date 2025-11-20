@@ -495,4 +495,66 @@ describe('JsonFileDatabase', () => {
       profile: { city: 'London', employer: { name: 'Analytical Engine' } }
     });
   });
+
+  test('join cache obeys max entries and evicts oldest', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir, joinCacheMaxEntries: 1 });
+
+    const alice = await db.insert('users', { name: 'Alice' });
+    const bob = await db.insert('users', { name: 'Bob' });
+
+    const postA = await db.insert('posts', { authorId: alice._id });
+    const postB = await db.insert('posts', { authorId: bob._id });
+
+    const first = await db.join('posts', postA, {
+      author: { localField: 'authorId', foreignCollection: 'users', projection: ['name'] }
+    });
+    expect(first.author).toEqual({ _id: alice._id, name: 'Alice' });
+
+    await db.join('posts', postB, {
+      author: { localField: 'authorId', foreignCollection: 'users', projection: ['name'] }
+    });
+
+    const state = await (db as unknown as { loadCollection: (c: string) => Promise<unknown> }).loadCollection(
+      'users'
+    );
+    const usersState = (state as { docs: Map<string, Record<string, unknown>> }).docs;
+    usersState.set(alice._id as string, { _id: alice._id, name: 'Alice updated' });
+
+    const rejoined = await db.join('posts', postA, {
+      author: { localField: 'authorId', foreignCollection: 'users', projection: ['name'] }
+    });
+    expect(rejoined.author).toEqual({ _id: alice._id, name: 'Alice updated' });
+  });
+
+  test('join cache TTL refreshes entries after expiry', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir, joinCacheTTLms: 5 });
+
+    const alice = await db.insert('users', { name: 'Alice' });
+    const post = await db.insert('posts', { authorId: alice._id });
+
+    const first = await db.join('posts', post, {
+      author: { localField: 'authorId', foreignCollection: 'users', projection: ['name'] }
+    });
+    expect(first.author).toEqual({ _id: alice._id, name: 'Alice' });
+
+    const state = await (db as unknown as { loadCollection: (c: string) => Promise<unknown> }).loadCollection(
+      'users'
+    );
+    const usersState = (state as { docs: Map<string, Record<string, unknown>> }).docs;
+    usersState.set(alice._id as string, { _id: alice._id, name: 'Alice new' });
+
+    const beforeExpiry = await db.join('posts', post, {
+      author: { localField: 'authorId', foreignCollection: 'users', projection: ['name'] }
+    });
+    expect(beforeExpiry.author).toEqual({ _id: alice._id, name: 'Alice' });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const afterExpiry = await db.join('posts', post, {
+      author: { localField: 'authorId', foreignCollection: 'users', projection: ['name'] }
+    });
+    expect(afterExpiry.author).toEqual({ _id: alice._id, name: 'Alice new' });
+  });
 });

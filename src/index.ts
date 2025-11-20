@@ -29,6 +29,8 @@ interface ResolvedOptions extends DatabaseOptions {
   indexDir: string;
   tokenizer: TokenizerOptions;
   schemas: Record<string, CollectionSchema>;
+  joinCacheMaxEntries: number;
+  joinCacheTTLms?: number;
 }
 
 interface CollectionState {
@@ -59,7 +61,10 @@ interface IndexFilePayload {
   entries: Record<string, DocumentId[]>;
 }
 
-const JOIN_CACHE_MAX_ENTRIES = 1000;
+interface JoinCacheEntry {
+  value: Document | null;
+  expiresAt: number;
+}
 
 const noopLogger: Logger = {
   debug: () => undefined,
@@ -75,7 +80,7 @@ class JsonFileDatabase implements Database {
   private manifestPath: string;
   private joinCache = new Map<
     string,
-    Map<string, Map<string, Document | null>>
+    Map<string, Map<string, JoinCacheEntry>>
   >();
 
   constructor(options: DatabaseOptions = {}) {
@@ -882,7 +887,7 @@ class JsonFileDatabase implements Database {
   private getJoinCacheBucket(
     collection: string,
     field: string
-  ): Map<DocumentId, Document | null> {
+  ): Map<DocumentId, JoinCacheEntry> {
     let fields = this.joinCache.get(collection);
     if (!fields) {
       fields = new Map();
@@ -903,17 +908,28 @@ class JsonFileDatabase implements Database {
   }
 
   private touchJoinCache(
-    bucket: Map<DocumentId, Document | null>,
+    bucket: Map<DocumentId, JoinCacheEntry>,
     id: DocumentId,
     value: Document | null
   ): void {
     bucket.delete(id);
-    bucket.set(id, value);
-    this.trimJoinCacheBucket(bucket);
+    const ttl = this.options.joinCacheTTLms;
+    const expiresAt =
+      typeof ttl === 'number' && ttl > 0 ? Date.now() + ttl : Number.POSITIVE_INFINITY;
+    bucket.set(id, { value, expiresAt });
+    this.trimJoinCacheBucket(bucket, this.options.joinCacheMaxEntries);
   }
 
-  private trimJoinCacheBucket(bucket: Map<DocumentId, Document | null>): void {
-    while (bucket.size > JOIN_CACHE_MAX_ENTRIES) {
+  private trimJoinCacheBucket(
+    bucket: Map<DocumentId, JoinCacheEntry>,
+    maxEntries: number
+  ): void {
+    if (maxEntries <= 0) {
+      bucket.clear();
+      return;
+    }
+
+    while (bucket.size > maxEntries) {
       const oldest = bucket.keys().next().value;
       if (oldest === undefined) {
         break;
@@ -933,10 +949,13 @@ class JsonFileDatabase implements Database {
 
     values.forEach((value) => {
       const cached = cache.get(value);
-      if (cached !== undefined) {
-        this.touchJoinCache(cache, value, cached);
-        results.set(value, cached ? cloneDocument(cached) : null);
+      if (cached && !isJoinCacheEntryExpired(cached)) {
+        this.touchJoinCache(cache, value, cached.value);
+        results.set(value, cached.value ? cloneDocument(cached.value) : null);
       } else {
+        if (cached && isJoinCacheEntryExpired(cached)) {
+          cache.delete(value);
+        }
         missing.add(value);
       }
     });
@@ -993,7 +1012,9 @@ function resolveOptions(options: DatabaseOptions): ResolvedOptions {
     log: options.log ?? noopLogger,
     autoCompact: options.autoCompact ?? true,
     snapshotInterval: options.snapshotInterval ?? 100,
-    logRetention: options.logRetention ?? 'truncate'
+    logRetention: options.logRetention ?? 'truncate',
+    joinCacheMaxEntries: options.joinCacheMaxEntries ?? 1000,
+    joinCacheTTLms: options.joinCacheTTLms
   };
 }
 
@@ -1088,6 +1109,10 @@ function resolveManyFlag(relation: JoinRelation, localValue: unknown): boolean {
 
 function serializeJoinKey(collection: string, field?: string): string {
   return `${collection}::${field ?? '_id'}`;
+}
+
+function isJoinCacheEntryExpired(entry: JoinCacheEntry): boolean {
+  return entry.expiresAt !== Number.POSITIVE_INFINITY && entry.expiresAt <= Date.now();
 }
 
 function projectDocument(
