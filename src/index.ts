@@ -20,10 +20,25 @@ interface ResolvedOptions extends DatabaseOptions {
 }
 
 interface CollectionState {
+  name: string;
   docs: Map<DocumentId, Document>;
   loaded: boolean;
   logPath: string;
   snapshotPath: string;
+  writesSinceSnapshot: number;
+  lastCheckpoint: number;
+}
+
+interface ManifestCollectionEntry {
+  checkpoint: number;
+  snapshotPath: string;
+  schema?: Record<string, unknown>;
+  updatedAt?: string;
+}
+
+interface Manifest {
+  manifestVersion: number;
+  collections: Record<string, ManifestCollectionEntry | undefined>;
 }
 
 const noopLogger: Logger = {
@@ -36,9 +51,12 @@ const noopLogger: Logger = {
 class JsonFileDatabase implements Database {
   private options: ResolvedOptions;
   private collections = new Map<string, CollectionState>();
+  private manifest: Manifest | null = null;
+  private manifestPath: string;
 
   constructor(options: DatabaseOptions = {}) {
     this.options = resolveOptions(options);
+     this.manifestPath = path.join(this.options.dataDir, 'manifest.json');
     ensureDirectories(this.options);
   }
 
@@ -52,7 +70,7 @@ class JsonFileDatabase implements Database {
 
     const stored: Document = { ...doc, _id };
     state.docs.set(_id, stored);
-    await this.appendLog(state, { _id, data: stored });
+    await this.appendLog(collection, state, { _id, data: stored });
     return cloneDocument(stored);
   }
 
@@ -76,7 +94,7 @@ class JsonFileDatabase implements Database {
 
     const updated: Document = { ...existing, ...mutation, _id: id };
     state.docs.set(id, updated);
-    await this.appendLog(state, { _id: id, data: updated });
+    await this.appendLog(collection, state, { _id: id, data: updated });
     return cloneDocument(updated);
   }
 
@@ -88,7 +106,7 @@ class JsonFileDatabase implements Database {
     }
 
     state.docs.delete(id);
-    await this.appendLog(state, { _id: id, tombstone: true });
+    await this.appendLog(collection, state, { _id: id, tombstone: true });
   }
 
   async find(
@@ -164,23 +182,36 @@ class JsonFileDatabase implements Database {
     throw new Error(`join not implemented for ${collection} with id ${doc._id}`);
   }
 
+  async compact(collection: string): Promise<void> {
+    const state = await this.loadCollection(collection);
+    await this.compactCollection(collection, state);
+  }
+
   private async loadCollection(collection: string): Promise<CollectionState> {
     const existing = this.collections.get(collection);
     if (existing?.loaded) {
       return existing;
     }
 
+    const manifest = await this.getManifest();
+    const manifestEntry = manifest.collections[collection];
+
     const state: CollectionState =
       existing ??
       {
+        name: collection,
         docs: new Map(),
         loaded: false,
         logPath: path.join(this.options.dataDir, `${collection}.jsonl`),
         snapshotPath: path.join(
           this.options.dataDir,
           `${collection}.snapshot.json`
-        )
+        ),
+        writesSinceSnapshot: 0,
+        lastCheckpoint: manifestEntry?.checkpoint ?? 0
       };
+
+    await this.ensureManifestEntry(collection, state.snapshotPath);
 
     const snapshotDocs = await readSnapshot(state.snapshotPath);
     snapshotDocs.forEach((doc) => {
@@ -189,7 +220,7 @@ class JsonFileDatabase implements Database {
       }
     });
 
-    const logEntries = await readLog(state.logPath);
+    const logEntries = await readLog(state.logPath, state.lastCheckpoint);
     logEntries.forEach((entry) => {
       if (!entry._id) {
         return;
@@ -205,16 +236,117 @@ class JsonFileDatabase implements Database {
       }
     });
 
+    state.writesSinceSnapshot = logEntries.length;
     state.loaded = true;
     this.collections.set(collection, state);
     return state;
   }
 
   private async appendLog(
+    collection: string,
     state: CollectionState,
     entry: Record<string, unknown>
   ): Promise<void> {
     await fsp.appendFile(state.logPath, `${JSON.stringify(entry)}\n`, 'utf8');
+    state.writesSinceSnapshot += 1;
+
+    const interval = this.options.snapshotInterval ?? 0;
+    const shouldCompact =
+      (this.options.autoCompact ?? true) &&
+      interval > 0 &&
+      state.writesSinceSnapshot >= interval;
+
+    if (shouldCompact) {
+      await this.compactCollection(collection, state);
+    }
+  }
+
+  private async compactCollection(
+    collection: string,
+    state: CollectionState
+  ): Promise<void> {
+    const docs = Array.from(state.docs.values()).map(cloneDocument);
+    const snapshotPayload = JSON.stringify({ docs }, null, 2);
+    await fsp.writeFile(state.snapshotPath, snapshotPayload, 'utf8');
+
+    const checkpoint = await getFileSize(state.logPath);
+    state.lastCheckpoint = checkpoint;
+    state.writesSinceSnapshot = 0;
+
+    await this.updateManifest(collection, {
+      checkpoint,
+      snapshotPath: state.snapshotPath
+    });
+  }
+
+  private async getManifest(): Promise<Manifest> {
+    if (this.manifest) {
+      return this.manifest;
+    }
+
+    try {
+      const raw = await fsp.readFile(this.manifestPath, 'utf8');
+      const parsed = JSON.parse(raw) as Manifest;
+      this.manifest = normalizeManifest(parsed);
+    } catch (error) {
+      if (isEnoentError(error)) {
+        this.manifest = { manifestVersion: 1, collections: {} };
+      } else {
+        throw error;
+      }
+    }
+
+    return this.manifest;
+  }
+
+  private async persistManifest(manifest: Manifest): Promise<void> {
+    this.manifest = manifest;
+    await fsp.writeFile(
+      this.manifestPath,
+      JSON.stringify(manifest, null, 2),
+      'utf8'
+    );
+  }
+
+  private async ensureManifestEntry(
+    collection: string,
+    snapshotPath: string
+  ): Promise<void> {
+    const manifest = await this.getManifest();
+    const entry = manifest.collections[collection];
+    if (entry) {
+      return;
+    }
+
+    manifest.collections[collection] = {
+      checkpoint: 0,
+      snapshotPath,
+      schema: {}
+    };
+
+    await this.persistManifest(manifest);
+  }
+
+  private async updateManifest(
+    collection: string,
+    updates: Pick<ManifestCollectionEntry, 'checkpoint' | 'snapshotPath'> & {
+      schema?: Record<string, unknown>;
+    }
+  ): Promise<void> {
+    const manifest = await this.getManifest();
+    const existing = manifest.collections[collection] ?? {
+      checkpoint: 0,
+      snapshotPath: updates.snapshotPath,
+      schema: {}
+    };
+
+    manifest.collections[collection] = {
+      ...existing,
+      ...updates,
+      updatedAt: new Date().toISOString()
+    };
+
+    await this.persistManifest(manifest);
   }
 }
 
@@ -226,8 +358,21 @@ function resolveOptions(options: DatabaseOptions): ResolvedOptions {
     ...options,
     dataDir,
     binaryDir,
-    log: options.log ?? noopLogger
+    log: options.log ?? noopLogger,
+    autoCompact: options.autoCompact ?? true,
+    snapshotInterval: options.snapshotInterval ?? 100
   };
+}
+
+function normalizeManifest(manifest: Manifest): Manifest {
+  const manifestVersion =
+    typeof manifest?.manifestVersion === 'number' ? manifest.manifestVersion : 1;
+  const collections =
+    manifest && typeof manifest.collections === 'object'
+      ? manifest.collections
+      : {};
+
+  return { manifestVersion, collections };
 }
 
 function ensureDirectories(options: ResolvedOptions): void {
@@ -256,11 +401,55 @@ async function readSnapshot(filePath: string): Promise<Document[]> {
   }
 }
 
+async function readFileFromPosition(filePath: string, offset: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    const stream = fs.createReadStream(filePath, {
+      encoding: 'utf8',
+      start: offset
+    });
+
+    stream.on('data', (chunk) => {
+      data += chunk;
+    });
+
+    stream.on('error', (error) => {
+      if (isEnoentError(error)) {
+        resolve('');
+        return;
+      }
+      reject(error);
+    });
+
+    stream.on('end', () => {
+      resolve(data);
+    });
+  });
+}
+
+async function getFileSize(filePath: string): Promise<number> {
+  try {
+    const stats = await fsp.stat(filePath);
+    return stats.size;
+  } catch (error) {
+    if (isEnoentError(error)) {
+      return 0;
+    }
+    throw error;
+  }
+}
+
 async function readLog(
-  filePath: string
+  filePath: string,
+  offset = 0
 ): Promise<Array<{ _id?: DocumentId; data?: Document; tombstone?: boolean }>> {
   try {
-    const raw = await fsp.readFile(filePath, 'utf8');
+    const size = await getFileSize(filePath);
+    if (offset >= size) {
+      return [];
+    }
+
+    const raw = await readFileFromPosition(filePath, offset);
     return raw
       .split('\n')
       .filter(Boolean)

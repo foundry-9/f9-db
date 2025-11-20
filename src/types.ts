@@ -40,6 +40,7 @@ export interface DatabaseOptions {
   binaryDir?: string;
   log?: Logger;
   autoCompact?: boolean;
+  snapshotInterval?: number;
   fsync?: 'always' | 'batch' | 'never';
 }
 
@@ -73,4 +74,5 @@ export interface Database {
     doc: Document,
     relations: Record<string, unknown>
   ) => Promise<Document>;
+  compact: (collection: string) => Promise<void>;
 }

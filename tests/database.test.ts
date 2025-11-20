@@ -101,4 +101,79 @@ describe('JsonFileDatabase', () => {
 
     expect(seen).toEqual(['Ada']);
   });
+
+  test('auto snapshots after the configured write interval', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({
+      dataDir,
+      binaryDir,
+      snapshotInterval: 2,
+      autoCompact: true
+    });
+
+    await db.insert('users', { name: 'Ada' });
+    await db.insert('users', { name: 'Bea' });
+
+    const snapshotPath = path.join(dataDir, 'users.snapshot.json');
+    const manifestPath = path.join(dataDir, 'manifest.json');
+    const logPath = path.join(dataDir, 'users.jsonl');
+
+    expect(fs.existsSync(snapshotPath)).toBe(true);
+    expect(fs.existsSync(manifestPath)).toBe(true);
+
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const checkpoint = manifest.collections?.users?.checkpoint;
+    expect(typeof checkpoint).toBe('number');
+
+    const logSize = fs.statSync(logPath).size;
+    expect(checkpoint).toBe(logSize);
+
+    const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+    expect(snapshot.docs).toHaveLength(2);
+  });
+
+  test('startup replays log entries only after the manifest checkpoint', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    const manifestPath = path.join(dataDir, 'manifest.json');
+    const snapshotPath = path.join(dataDir, 'users.snapshot.json');
+    const logPath = path.join(dataDir, 'users.jsonl');
+
+    const docId = 'abc123';
+    const checkpointPrefix = 'BROKEN JSON\n';
+    const snapshotDocs = { docs: [{ _id: docId, name: 'before' }] };
+    fs.writeFileSync(snapshotPath, JSON.stringify(snapshotDocs, null, 2), 'utf8');
+
+    const updateEntry = {
+      _id: docId,
+      data: { _id: docId, name: 'after' }
+    };
+    fs.writeFileSync(
+      logPath,
+      `${checkpointPrefix}${JSON.stringify(updateEntry)}\n`,
+      'utf8'
+    );
+
+    fs.writeFileSync(
+      manifestPath,
+      JSON.stringify(
+        {
+          manifestVersion: 1,
+          collections: {
+            users: {
+              checkpoint: Buffer.byteLength(checkpointPrefix),
+              snapshotPath
+            }
+          }
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+
+    db = createDatabase({ dataDir, binaryDir });
+    const result = await db.get('users', docId);
+
+    expect(result?.name).toBe('after');
+  });
 });
