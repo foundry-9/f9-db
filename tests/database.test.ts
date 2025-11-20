@@ -233,4 +233,58 @@ describe('JsonFileDatabase', () => {
     );
     expect(rotatedContent).toContain('"name":"Ada"');
   });
+
+  test('ensureIndex builds index file and records checkpoint/stats', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir, autoCompact: false });
+
+    const ada = await db.insert('users', { name: 'Ada Lovelace' });
+    const bob = await db.insert('users', { name: 'Bob' });
+
+    await db.ensureIndex('users', 'name');
+
+    const manifestPath = path.join(dataDir, 'manifest.json');
+    const logPath = path.join(dataDir, 'users.jsonl');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const metadata = manifest.collections?.users?.indexes?.name;
+
+    expect(metadata?.state).toBe('ready');
+    expect(metadata?.checkpoint).toBe(fs.statSync(logPath).size);
+    expect(metadata?.stats?.docCount).toBe(2);
+    expect(metadata?.stats?.tokenCount).toBeGreaterThanOrEqual(2);
+
+    const indexPath = path.join(dataDir, 'indexes', 'users', 'name.json');
+    const indexFile = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+    expect(indexFile.meta.state).toBe('ready');
+    expect(indexFile.entries.ada).toEqual([ada._id]);
+    expect(indexFile.entries.bob).toEqual([bob._id]);
+  });
+
+  test('rebuildIndex refreshes entries and bumps version/checkpoint', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir, autoCompact: false });
+
+    await db.insert('users', { name: 'Ada' });
+    await db.ensureIndex('users', 'name');
+
+    const manifestPath = path.join(dataDir, 'manifest.json');
+    const firstMetadata = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).collections
+      ?.users?.indexes?.name;
+
+    const carol = await db.insert('users', { name: 'Carol' });
+    await db.rebuildIndex('users', 'name');
+
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const metadata = manifest.collections?.users?.indexes?.name;
+    const logPath = path.join(dataDir, 'users.jsonl');
+
+    expect(metadata?.version).toBe((firstMetadata?.version ?? 0) + 1);
+    expect(metadata?.state).toBe('ready');
+    expect(metadata?.checkpoint).toBe(fs.statSync(logPath).size);
+    expect(metadata?.stats?.docCount).toBe(2);
+
+    const indexPath = path.join(dataDir, 'indexes', 'users', 'name.json');
+    const indexFile = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+    expect(indexFile.entries.carol).toEqual([carol._id]);
+  });
 });

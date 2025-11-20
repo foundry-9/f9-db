@@ -11,6 +11,7 @@ import type {
   FindOptions,
   IndexOptions,
   IndexMetadata,
+  IndexStats,
   JoinRelations,
   Logger,
   NormalizedIndexOptions,
@@ -173,7 +174,7 @@ class JsonFileDatabase implements Database {
     field: string,
     options: IndexOptions = {}
   ): Promise<void> {
-    await this.loadCollection(collection);
+    const state = await this.loadCollection(collection);
     const normalized = normalizeIndexOptions(options, this.options.tokenizer);
     const indexPath = this.getIndexPath(collection, field);
 
@@ -205,6 +206,7 @@ class JsonFileDatabase implements Database {
     });
 
     await writeIndexStub(indexPath, metadata);
+    await this.buildIndex(collection, field, metadata, state);
     this.options.log?.info?.('Index metadata recorded', {
       collection,
       field,
@@ -214,7 +216,7 @@ class JsonFileDatabase implements Database {
   }
 
   async rebuildIndex(collection: string, field: string): Promise<void> {
-    await this.loadCollection(collection);
+    const state = await this.loadCollection(collection);
     const manifest = await this.getManifest();
     const existing = manifest.collections[collection]?.indexes?.[field];
 
@@ -238,6 +240,7 @@ class JsonFileDatabase implements Database {
     });
 
     await writeIndexStub(this.getIndexPath(collection, field), metadata);
+    await this.buildIndex(collection, field, metadata, state);
     this.options.log?.info?.('Index rebuild scheduled', {
       collection,
       field,
@@ -453,6 +456,66 @@ class JsonFileDatabase implements Database {
   private getIndexPath(collection: string, field: string): string {
     return path.join(this.options.indexDir, collection, `${field}.json`);
   }
+
+  private async buildIndex(
+    collection: string,
+    field: string,
+    metadata: IndexMetadata,
+    state: CollectionState
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const baseMeta: IndexMetadata = { ...metadata, updatedAt: now };
+    const logCheckpoint = await getFileSize(state.logPath);
+
+    try {
+      const { entries, tokenCount } = buildIndexEntries(
+        state.docs,
+        field,
+        metadata.options
+      );
+      const readyMeta: IndexMetadata = {
+        ...baseMeta,
+        state: 'ready',
+        checkpoint: logCheckpoint,
+        lastError: undefined,
+        stats: {
+          docCount: state.docs.size,
+          tokenCount,
+          builtAt: now
+        }
+      };
+
+      const payload = {
+        meta: readyMeta,
+        entries
+      };
+
+      await ensureIndexDirectory(metadata.path);
+      await fsp.writeFile(metadata.path, JSON.stringify(payload, null, 2), 'utf8');
+
+      const sizeBytes = await getFileSize(metadata.path);
+      const finalMeta: IndexMetadata = {
+        ...readyMeta,
+        stats: { ...(readyMeta.stats as IndexStats), sizeBytes }
+      };
+
+      await this.updateManifest(collection, {
+        indexes: { [field]: finalMeta }
+      });
+    } catch (error) {
+      const failedMeta: IndexMetadata = {
+        ...baseMeta,
+        state: 'error',
+        lastError: error instanceof Error ? error.message : String(error)
+      };
+
+      await this.updateManifest(collection, {
+        indexes: { [field]: failedMeta }
+      });
+
+      throw error;
+    }
+  }
 }
 
 function resolveOptions(options: DatabaseOptions): ResolvedOptions {
@@ -590,6 +653,95 @@ async function writeIndexStub(
 
   await ensureIndexDirectory(indexPath);
   await fsp.writeFile(indexPath, JSON.stringify(payload, null, 2), 'utf8');
+}
+
+function buildIndexEntries(
+  docs: Map<DocumentId, Document>,
+  field: string,
+  options: NormalizedIndexOptions
+): { entries: Record<string, DocumentId[]>; tokenCount: number } {
+  const postings = new Map<string, Set<DocumentId>>();
+  let tokenCount = 0;
+
+  for (const doc of docs.values()) {
+    const id = doc._id;
+    if (typeof id !== 'string') {
+      continue;
+    }
+
+    const value = (doc as Record<string, unknown>)[field];
+    const tokens = collectTokens(value, options);
+
+    for (const token of tokens) {
+      const entry = postings.get(token) ?? new Set<DocumentId>();
+      const before = entry.size;
+      entry.add(id);
+      postings.set(token, entry);
+
+      if (entry.size > before) {
+        tokenCount += 1;
+      }
+    }
+  }
+
+  const entries: Record<string, DocumentId[]> = {};
+  Array.from(postings.keys())
+    .sort()
+    .forEach((token) => {
+      const ids = postings.get(token);
+      if (!ids) {
+        return;
+      }
+      entries[token] = Array.from(ids).sort();
+    });
+
+  return { entries, tokenCount };
+}
+
+function collectTokens(
+  value: unknown,
+  options: NormalizedIndexOptions
+): string[] {
+  const values = Array.isArray(value) ? value : [value];
+  const tokens: string[] = [];
+
+  for (const candidate of values) {
+    if (typeof candidate !== 'string') {
+      continue;
+    }
+
+    const baseTokens = tokenizeString(candidate, options.tokenizer);
+    const prefixLength = options.prefixLength ?? 0;
+
+    for (const token of baseTokens) {
+      tokens.push(token);
+
+      if (prefixLength > 0 && token.length >= prefixLength) {
+        tokens.push(token.slice(0, prefixLength));
+      }
+    }
+  }
+
+  return tokens;
+}
+
+function tokenizeString(
+  value: string,
+  tokenizer: TokenizerOptions
+): string[] {
+  const normalized = tokenizer.lowerCase ? value.toLowerCase() : value;
+  const splitRegex = new RegExp(tokenizer.splitRegex, 'g');
+  const stopwords = tokenizer.lowerCase
+    ? tokenizer.stopwords.map((word) => word.toLowerCase())
+    : tokenizer.stopwords;
+
+  return normalized
+    .split(splitRegex)
+    .map((token) => token.trim())
+    .filter(
+      (token) =>
+        token.length >= tokenizer.minTokenLength && !stopwords.includes(token)
+    );
 }
 
 async function readSnapshot(filePath: string): Promise<Document[]> {
