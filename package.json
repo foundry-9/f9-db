@@ -1,0 +1,34 @@
+{
+  "name": "f9-db",
+  "version": "0.1.0",
+  "description": "Pure Javascript database",
+  "keywords": [
+    "f9",
+    "foundry-9",
+    "database",
+    "javascript"
+  ],
+  "homepage": "https://github.com/foundry-9/f9-db#readme",
+  "bugs": {
+    "url": "https://github.com/foundry-9/f9-db/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/foundry-9/f9-db.git"
+  },
+  "license": "MIT",
+  "author": "Charles Sebold <charles@sebold.tech>",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest",
+    "build": "tsc",
+    "lint": "eslint . --ext .ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.1",
+    "eslint": "^9.39.1",
+    "jest": "^30.2.0",
+    "typescript": "^5.9.3"
+  }
+}
