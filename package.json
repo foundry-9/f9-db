@@ -1,6 +1,6 @@
 {
   "name": "f9-db",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pure Javascript database",
   "keywords": [
     "f9",
@@ -25,7 +25,7 @@
     "dist"
   ],
   "scripts": {
-    "test": "jest",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "build": "tsc --project tsconfig.json",
     "lint": "eslint . --ext .ts --ext .tsx",
     "clean": "rm -rf dist"

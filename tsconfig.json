@@ -11,6 +11,7 @@
     "inlineSources": true,
     "strict": true,
     "noUnusedLocals": true,
+    "isolatedModules": true,
     "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true,
     "esModuleInterop": true,
@@ -23,8 +24,7 @@
     ]
   },
   "include": [
-    "src/**/*.ts",
-    "tests/**/*.ts"
+    "src/**/*.ts"
   ],
   "exclude": [
     "dist",
