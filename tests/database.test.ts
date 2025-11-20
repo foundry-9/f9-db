@@ -176,4 +176,61 @@ describe('JsonFileDatabase', () => {
 
     expect(result?.name).toBe('after');
   });
+
+  test('truncates log after snapshot by default to reclaim disk', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({
+      dataDir,
+      binaryDir,
+      snapshotInterval: 1,
+      autoCompact: true
+    });
+
+    await db.insert('users', { name: 'Ada' });
+
+    const logPath = path.join(dataDir, 'users.jsonl');
+    const manifestPath = path.join(dataDir, 'manifest.json');
+    const snapshotPath = path.join(dataDir, 'users.snapshot.json');
+
+    expect(fs.readFileSync(logPath, 'utf8')).toBe('');
+    const checkpoint = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).collections
+      ?.users?.checkpoint;
+    expect(checkpoint).toBe(0);
+
+    const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+    expect(snapshot.docs).toHaveLength(1);
+    expect(snapshot.docs[0]?.name).toBe('Ada');
+  });
+
+  test('rotates log after snapshot when logRetention is rotate', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({
+      dataDir,
+      binaryDir,
+      snapshotInterval: 1,
+      autoCompact: true,
+      logRetention: 'rotate'
+    });
+
+    await db.insert('users', { name: 'Ada' });
+
+    const logPath = path.join(dataDir, 'users.jsonl');
+    const manifestPath = path.join(dataDir, 'manifest.json');
+    const rotatedFiles = fs
+      .readdirSync(dataDir)
+      .filter((file) => file.startsWith('users.jsonl.') && file.endsWith('.bak'));
+
+    expect(rotatedFiles.length).toBe(1);
+    expect(fs.readFileSync(logPath, 'utf8')).toBe('');
+
+    const checkpoint = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).collections
+      ?.users?.checkpoint;
+    expect(checkpoint).toBe(0);
+
+    const rotatedContent = fs.readFileSync(
+      path.join(dataDir, rotatedFiles[0] as string),
+      'utf8'
+    );
+    expect(rotatedContent).toContain('"name":"Ada"');
+  });
 });

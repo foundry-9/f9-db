@@ -17,6 +17,7 @@ interface ResolvedOptions extends DatabaseOptions {
   dataDir: string;
   binaryDir: string;
   log: Logger;
+  logRetention: 'truncate' | 'rotate' | 'keep';
 }
 
 interface CollectionState {
@@ -269,7 +270,21 @@ class JsonFileDatabase implements Database {
     const snapshotPayload = JSON.stringify({ docs }, null, 2);
     await fsp.writeFile(state.snapshotPath, snapshotPayload, 'utf8');
 
-    const checkpoint = await getFileSize(state.logPath);
+    let checkpoint = await getFileSize(state.logPath);
+
+    if (this.options.logRetention === 'truncate') {
+      await truncateFile(state.logPath);
+      checkpoint = 0;
+    } else if (this.options.logRetention === 'rotate') {
+      const rotatedPath = await rotateLogFile(state.logPath);
+      this.options.log?.info?.('Rotated log file', {
+        collection,
+        rotatedPath
+      });
+      await fsp.writeFile(state.logPath, '', 'utf8');
+      checkpoint = 0;
+    }
+
     state.lastCheckpoint = checkpoint;
     state.writesSinceSnapshot = 0;
 
@@ -360,7 +375,8 @@ function resolveOptions(options: DatabaseOptions): ResolvedOptions {
     binaryDir,
     log: options.log ?? noopLogger,
     autoCompact: options.autoCompact ?? true,
-    snapshotInterval: options.snapshotInterval ?? 100
+    snapshotInterval: options.snapshotInterval ?? 100,
+    logRetention: options.logRetention ?? 'truncate'
   };
 }
 
@@ -436,6 +452,50 @@ async function getFileSize(filePath: string): Promise<number> {
       return 0;
     }
     throw error;
+  }
+}
+
+async function truncateFile(filePath: string): Promise<void> {
+  try {
+    await fsp.truncate(filePath, 0);
+  } catch (error) {
+    if (isEnoentError(error)) {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function rotateLogFile(filePath: string): Promise<string> {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  let candidate = path.join(dir, `${base}.${timestamp}.bak`);
+  let counter = 0;
+
+  // Ensure unique rotated filename if called rapidly.
+  while (await fileExists(candidate)) {
+    counter += 1;
+    candidate = path.join(dir, `${base}.${timestamp}-${counter}.bak`);
+  }
+
+  try {
+    await fsp.rename(filePath, candidate);
+    return candidate;
+  } catch (error) {
+    if (isEnoentError(error)) {
+      return candidate;
+    }
+    throw error;
+  }
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fsp.access(filePath);
+    return true;
+  } catch {
+    return false;
   }
 }
 

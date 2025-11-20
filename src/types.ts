@@ -41,6 +41,7 @@ export interface DatabaseOptions {
   log?: Logger;
   autoCompact?: boolean;
   snapshotInterval?: number;
+  logRetention?: 'truncate' | 'rotate' | 'keep';
   fsync?: 'always' | 'batch' | 'never';
 }
 
