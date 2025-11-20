@@ -28,6 +28,52 @@ export interface IndexOptions {
   prefixLength?: number;
 }
 
+export type IndexState = 'pending' | 'ready' | 'stale' | 'error';
+
+export interface TokenizerOptions {
+  lowerCase: boolean;
+  minTokenLength: number;
+  splitRegex: string;
+  stopwords: string[];
+}
+
+export interface NormalizedIndexOptions {
+  unique: boolean;
+  prefixLength?: number;
+  tokenizer: TokenizerOptions;
+}
+
+export interface IndexStats {
+  docCount: number;
+  tokenCount: number;
+  sizeBytes?: number;
+  builtAt?: string;
+}
+
+export interface IndexMetadata {
+  field: string;
+  path: string;
+  state: IndexState;
+  version: number;
+  checkpoint: number;
+  options: NormalizedIndexOptions;
+  createdAt?: string;
+  updatedAt?: string;
+  lastError?: string;
+  stats?: IndexStats;
+}
+
+export interface JoinRelation {
+  localField: string;
+  foreignCollection: string;
+  foreignField?: string;
+  as?: string;
+  many?: boolean;
+  projection?: string[];
+}
+
+export type JoinRelations = Record<string, JoinRelation | JoinRelation[]>;
+
 export interface Logger {
   debug?: (msg: string, context?: Record<string, unknown>) => void;
   info?: (msg: string, context?: Record<string, unknown>) => void;
@@ -43,6 +89,8 @@ export interface DatabaseOptions {
   snapshotInterval?: number;
   logRetention?: 'truncate' | 'rotate' | 'keep';
   fsync?: 'always' | 'batch' | 'never';
+  indexDir?: string;
+  tokenizer?: Partial<TokenizerOptions>;
 }
 
 export interface Database {
@@ -73,7 +121,7 @@ export interface Database {
   join: (
     collection: string,
     doc: Document,
-    relations: Record<string, unknown>
+    relations: JoinRelations
   ) => Promise<Document>;
   compact: (collection: string) => Promise<void>;
 }

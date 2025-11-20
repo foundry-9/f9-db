@@ -10,7 +10,11 @@ import type {
   Filter,
   FindOptions,
   IndexOptions,
-  Logger
+  IndexMetadata,
+  JoinRelations,
+  Logger,
+  NormalizedIndexOptions,
+  TokenizerOptions
 } from './types.js';
 
 interface ResolvedOptions extends DatabaseOptions {
@@ -18,6 +22,8 @@ interface ResolvedOptions extends DatabaseOptions {
   binaryDir: string;
   log: Logger;
   logRetention: 'truncate' | 'rotate' | 'keep';
+  indexDir: string;
+  tokenizer: TokenizerOptions;
 }
 
 interface CollectionState {
@@ -34,6 +40,7 @@ interface ManifestCollectionEntry {
   checkpoint: number;
   snapshotPath: string;
   schema?: Record<string, unknown>;
+  indexes: Record<string, IndexMetadata | undefined>;
   updatedAt?: string;
 }
 
@@ -166,21 +173,90 @@ class JsonFileDatabase implements Database {
     field: string,
     options: IndexOptions = {}
   ): Promise<void> {
-    void options;
-    throw new Error(`Indexes are not implemented yet for ${collection}.${field}`);
+    await this.loadCollection(collection);
+    const normalized = normalizeIndexOptions(options, this.options.tokenizer);
+    const indexPath = this.getIndexPath(collection, field);
+
+    const manifest = await this.getManifest();
+    const collectionEntry = manifest.collections[collection];
+    const existing = collectionEntry?.indexes?.[field];
+    const now = new Date().toISOString();
+    const optionsChanged = existing
+      ? !indexOptionsEqual(existing.options, normalized)
+      : true;
+
+    const metadata: IndexMetadata = {
+      field,
+      path: indexPath,
+      options: normalized,
+      version: optionsChanged
+        ? (existing?.version ?? 0) + 1
+        : existing?.version ?? 1,
+      state: optionsChanged ? 'pending' : existing?.state ?? 'pending',
+      checkpoint: optionsChanged ? 0 : existing?.checkpoint ?? 0,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      stats: optionsChanged ? undefined : existing?.stats,
+      lastError: optionsChanged ? undefined : existing?.lastError
+    };
+
+    await this.updateManifest(collection, {
+      indexes: { [field]: metadata }
+    });
+
+    await writeIndexStub(indexPath, metadata);
+    this.options.log?.info?.('Index metadata recorded', {
+      collection,
+      field,
+      state: metadata.state,
+      version: metadata.version
+    });
   }
 
   async rebuildIndex(collection: string, field: string): Promise<void> {
-    throw new Error(`Indexes are not implemented yet for ${collection}.${field}`);
+    await this.loadCollection(collection);
+    const manifest = await this.getManifest();
+    const existing = manifest.collections[collection]?.indexes?.[field];
+
+    if (!existing) {
+      await this.ensureIndex(collection, field);
+      return;
+    }
+
+    const metadata: IndexMetadata = {
+      ...existing,
+      state: 'pending',
+      checkpoint: 0,
+      stats: undefined,
+      lastError: undefined,
+      version: existing.version + 1,
+      updatedAt: new Date().toISOString()
+    };
+
+    await this.updateManifest(collection, {
+      indexes: { [field]: metadata }
+    });
+
+    await writeIndexStub(this.getIndexPath(collection, field), metadata);
+    this.options.log?.info?.('Index rebuild scheduled', {
+      collection,
+      field,
+      version: metadata.version
+    });
   }
 
   async join(
     collection: string,
     doc: Document,
-    relations: Record<string, unknown>
+    relations: JoinRelations
   ): Promise<Document> {
-    void relations;
-    throw new Error(`join not implemented for ${collection} with id ${doc._id}`);
+    this.options.log?.warn?.('join is stubbed; returning original document', {
+      collection,
+      id: doc._id,
+      relations: Object.keys(relations ?? {})
+    });
+
+    return cloneDocument(doc);
   }
 
   async compact(collection: string): Promise<void> {
@@ -336,7 +412,8 @@ class JsonFileDatabase implements Database {
     manifest.collections[collection] = {
       checkpoint: 0,
       snapshotPath,
-      schema: {}
+      schema: {},
+      indexes: {}
     };
 
     await this.persistManifest(manifest);
@@ -344,24 +421,37 @@ class JsonFileDatabase implements Database {
 
   private async updateManifest(
     collection: string,
-    updates: Pick<ManifestCollectionEntry, 'checkpoint' | 'snapshotPath'> & {
-      schema?: Record<string, unknown>;
+    updates: Partial<
+      Pick<ManifestCollectionEntry, 'checkpoint' | 'snapshotPath' | 'schema'>
+    > & {
+      indexes?: Record<string, IndexMetadata | undefined>;
     }
   ): Promise<void> {
     const manifest = await this.getManifest();
     const existing = manifest.collections[collection] ?? {
       checkpoint: 0,
-      snapshotPath: updates.snapshotPath,
-      schema: {}
+      snapshotPath:
+        updates.snapshotPath ??
+        path.join(this.options.dataDir, `${collection}.snapshot.json`),
+      schema: {},
+      indexes: {}
     };
 
     manifest.collections[collection] = {
       ...existing,
       ...updates,
+      indexes:
+        updates.indexes !== undefined
+          ? { ...existing.indexes, ...updates.indexes }
+          : existing.indexes,
       updatedAt: new Date().toISOString()
     };
 
     await this.persistManifest(manifest);
+  }
+
+  private getIndexPath(collection: string, field: string): string {
+    return path.join(this.options.indexDir, collection, `${field}.json`);
   }
 }
 
@@ -369,10 +459,14 @@ function resolveOptions(options: DatabaseOptions): ResolvedOptions {
   const dataDir = options.dataDir ?? path.resolve(process.cwd(), 'data');
   const binaryDir =
     options.binaryDir ?? path.resolve(process.cwd(), 'binaries');
+  const indexDir = options.indexDir ?? path.join(dataDir, 'indexes');
+  const tokenizer = resolveTokenizer(options.tokenizer);
   return {
     ...options,
     dataDir,
     binaryDir,
+    indexDir,
+    tokenizer,
     log: options.log ?? noopLogger,
     autoCompact: options.autoCompact ?? true,
     snapshotInterval: options.snapshotInterval ?? 100,
@@ -380,13 +474,46 @@ function resolveOptions(options: DatabaseOptions): ResolvedOptions {
   };
 }
 
+function resolveTokenizer(
+  overrides: Partial<TokenizerOptions> | undefined
+): TokenizerOptions {
+  return {
+    lowerCase: overrides?.lowerCase ?? true,
+    minTokenLength: overrides?.minTokenLength ?? 2,
+    splitRegex: overrides?.splitRegex ?? '[^a-zA-Z0-9]+',
+    stopwords: overrides?.stopwords ?? []
+  };
+}
+
 function normalizeManifest(manifest: Manifest): Manifest {
   const manifestVersion =
     typeof manifest?.manifestVersion === 'number' ? manifest.manifestVersion : 1;
-  const collections =
-    manifest && typeof manifest.collections === 'object'
-      ? manifest.collections
-      : {};
+  const collections: Record<string, ManifestCollectionEntry | undefined> = {};
+
+  if (manifest && typeof manifest.collections === 'object') {
+    Object.entries(manifest.collections).forEach(([name, entry]) => {
+      if (!entry) {
+        collections[name] = undefined;
+        return;
+      }
+
+      const indexes =
+        entry.indexes && typeof entry.indexes === 'object' ? entry.indexes : {};
+
+      collections[name] = {
+        checkpoint:
+          typeof entry.checkpoint === 'number' ? entry.checkpoint : 0,
+        snapshotPath:
+          typeof entry.snapshotPath === 'string' ? entry.snapshotPath : '',
+        schema:
+          entry.schema && typeof entry.schema === 'object'
+            ? entry.schema
+            : undefined,
+        indexes,
+        updatedAt: entry.updatedAt
+      };
+    });
+  }
 
   return { manifestVersion, collections };
 }
@@ -394,6 +521,75 @@ function normalizeManifest(manifest: Manifest): Manifest {
 function ensureDirectories(options: ResolvedOptions): void {
   fs.mkdirSync(options.dataDir, { recursive: true });
   fs.mkdirSync(options.binaryDir, { recursive: true });
+  fs.mkdirSync(options.indexDir, { recursive: true });
+}
+
+function normalizeIndexOptions(
+  options: IndexOptions,
+  tokenizer: TokenizerOptions
+): NormalizedIndexOptions {
+  return {
+    unique: options.unique ?? false,
+    prefixLength: options.prefixLength,
+    tokenizer: { ...tokenizer }
+  };
+}
+
+function indexOptionsEqual(
+  left: NormalizedIndexOptions,
+  right: NormalizedIndexOptions
+): boolean {
+  return (
+    left.unique === right.unique &&
+    left.prefixLength === right.prefixLength &&
+    tokenizerEqual(left.tokenizer, right.tokenizer)
+  );
+}
+
+function tokenizerEqual(
+  left: TokenizerOptions,
+  right: TokenizerOptions
+): boolean {
+  return (
+    left.lowerCase === right.lowerCase &&
+    left.minTokenLength === right.minTokenLength &&
+    left.splitRegex === right.splitRegex &&
+    arrayShallowEqual(left.stopwords, right.stopwords)
+  );
+}
+
+function arrayShallowEqual(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((value, idx) => value === right[idx]);
+}
+
+async function ensureIndexDirectory(indexPath: string): Promise<void> {
+  await fsp.mkdir(path.dirname(indexPath), { recursive: true });
+}
+
+async function writeIndexStub(
+  indexPath: string,
+  metadata: IndexMetadata
+): Promise<void> {
+  const payload = {
+    meta: {
+      field: metadata.field,
+      state: metadata.state,
+      version: metadata.version,
+      checkpoint: metadata.checkpoint,
+      options: metadata.options,
+      createdAt: metadata.createdAt,
+      updatedAt: metadata.updatedAt,
+      stats: metadata.stats
+    },
+    entries: []
+  };
+
+  await ensureIndexDirectory(indexPath);
+  await fsp.writeFile(indexPath, JSON.stringify(payload, null, 2), 'utf8');
 }
 
 async function readSnapshot(filePath: string): Promise<Document[]> {
