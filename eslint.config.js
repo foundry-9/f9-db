@@ -24,7 +24,7 @@ export default [
       parserOptions: {
         sourceType: 'module',
         ecmaVersion: 'latest',
-        project: './tsconfig.json'
+        project: './tsconfig.eslint.json'
       },
       globals: {
         ...globals.node
