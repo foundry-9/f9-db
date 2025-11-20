@@ -15,7 +15,9 @@ import type {
   JoinRelations,
   Logger,
   NormalizedIndexOptions,
-  TokenizerOptions
+  TokenizerOptions,
+  CollectionSchema,
+  FieldSchema
 } from './types.js';
 
 interface ResolvedOptions extends DatabaseOptions {
@@ -25,6 +27,7 @@ interface ResolvedOptions extends DatabaseOptions {
   logRetention: 'truncate' | 'rotate' | 'keep';
   indexDir: string;
   tokenizer: TokenizerOptions;
+  schemas: Record<string, CollectionSchema>;
 }
 
 interface CollectionState {
@@ -40,7 +43,7 @@ interface CollectionState {
 interface ManifestCollectionEntry {
   checkpoint: number;
   snapshotPath: string;
-  schema?: Record<string, unknown>;
+  schema?: CollectionSchema;
   indexes: Record<string, IndexMetadata | undefined>;
   updatedAt?: string;
 }
@@ -70,7 +73,7 @@ class JsonFileDatabase implements Database {
 
   constructor(options: DatabaseOptions = {}) {
     this.options = resolveOptions(options);
-     this.manifestPath = path.join(this.options.dataDir, 'manifest.json');
+    this.manifestPath = path.join(this.options.dataDir, 'manifest.json');
     ensureDirectories(this.options);
   }
 
@@ -83,11 +86,16 @@ class JsonFileDatabase implements Database {
     }
 
     const stored: Document = { ...doc, _id };
-    await this.enforceUniqueConstraints(collection, stored, state, null);
-    state.docs.set(_id, stored);
-    await this.appendLog(collection, state, { _id, data: stored });
-    await this.refreshIndexesForWrite(collection, state, stored, null);
-    return cloneDocument(stored);
+    const normalized = await this.normalizeAndValidateDocument(
+      collection,
+      stored,
+      true
+    );
+    await this.enforceUniqueConstraints(collection, normalized, state, null);
+    state.docs.set(_id, normalized);
+    await this.appendLog(collection, state, { _id, data: normalized });
+    await this.refreshIndexesForWrite(collection, state, normalized, null);
+    return cloneDocument(normalized);
   }
 
   async get(collection: string, id: DocumentId): Promise<Document | null> {
@@ -109,11 +117,16 @@ class JsonFileDatabase implements Database {
     }
 
     const updated: Document = { ...existing, ...mutation, _id: id };
-    await this.enforceUniqueConstraints(collection, updated, state, id);
-    state.docs.set(id, updated);
-    await this.appendLog(collection, state, { _id: id, data: updated });
-    await this.refreshIndexesForWrite(collection, state, updated, existing);
-    return cloneDocument(updated);
+    const normalized = await this.normalizeAndValidateDocument(
+      collection,
+      updated,
+      false
+    );
+    await this.enforceUniqueConstraints(collection, normalized, state, id);
+    state.docs.set(id, normalized);
+    await this.appendLog(collection, state, { _id: id, data: normalized });
+    await this.refreshIndexesForWrite(collection, state, normalized, existing);
+    return cloneDocument(normalized);
   }
 
   async remove(collection: string, id: DocumentId): Promise<void> {
@@ -366,6 +379,9 @@ class JsonFileDatabase implements Database {
     state: CollectionState
   ): Promise<void> {
     const docs = Array.from(state.docs.values()).map(cloneDocument);
+    for (const doc of docs) {
+      await this.normalizeAndValidateDocument(collection, doc, false);
+    }
     const snapshotPayload = JSON.stringify({ docs }, null, 2);
     await fsp.writeFile(state.snapshotPath, snapshotPayload, 'utf8');
 
@@ -428,14 +444,22 @@ class JsonFileDatabase implements Database {
   ): Promise<void> {
     const manifest = await this.getManifest();
     const entry = manifest.collections[collection];
+    const providedSchema = this.options.schemas[collection];
     if (entry) {
+      if (!entry.schema && providedSchema) {
+        manifest.collections[collection] = {
+          ...entry,
+          schema: cloneDocument(providedSchema)
+        };
+        await this.persistManifest(manifest);
+      }
       return;
     }
 
     manifest.collections[collection] = {
       checkpoint: 0,
       snapshotPath,
-      schema: {},
+      schema: providedSchema ? cloneDocument(providedSchema) : undefined,
       indexes: {}
     };
 
@@ -456,7 +480,9 @@ class JsonFileDatabase implements Database {
       snapshotPath:
         updates.snapshotPath ??
         path.join(this.options.dataDir, `${collection}.snapshot.json`),
-      schema: {},
+      schema: this.options.schemas[collection]
+        ? cloneDocument(this.options.schemas[collection])
+        : undefined,
       indexes: {}
     };
 
@@ -471,6 +497,11 @@ class JsonFileDatabase implements Database {
     };
 
     await this.persistManifest(manifest);
+  }
+
+  private async getCollectionSchema(collection: string): Promise<CollectionSchema | null> {
+    const manifest = await this.getManifest();
+    return manifest.collections[collection]?.schema ?? null;
   }
 
   private getIndexPath(collection: string, field: string): string {
@@ -546,6 +577,25 @@ class JsonFileDatabase implements Database {
 
       throw error;
     }
+  }
+
+  private async normalizeAndValidateDocument(
+    collection: string,
+    doc: Document,
+    applyDefaults: boolean
+  ): Promise<Document> {
+    const schema = await this.getCollectionSchema(collection);
+    if (!schema) {
+      return cloneDocument(doc);
+    }
+
+    const cloned = cloneDocument(doc);
+    const withDefaults = applyDefaults
+      ? applyDefaultsToDocument(cloned, schema)
+      : cloned;
+
+    validateDocumentAgainstSchema(withDefaults, schema);
+    return withDefaults;
   }
 
   private async enforceUniqueConstraints(
@@ -790,6 +840,7 @@ function resolveOptions(options: DatabaseOptions): ResolvedOptions {
     binaryDir,
     indexDir,
     tokenizer,
+    schemas: options.schemas ?? {},
     log: options.log ?? noopLogger,
     autoCompact: options.autoCompact ?? true,
     snapshotInterval: options.snapshotInterval ?? 100,
@@ -806,6 +857,15 @@ function resolveTokenizer(
     splitRegex: overrides?.splitRegex ?? '[^a-zA-Z0-9]+',
     stopwords: overrides?.stopwords ?? []
   };
+}
+
+function isCollectionSchema(value: unknown): value is CollectionSchema {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    typeof (value as CollectionSchema).fields === 'object'
+  );
 }
 
 function normalizeManifest(manifest: Manifest): Manifest {
@@ -828,10 +888,7 @@ function normalizeManifest(manifest: Manifest): Manifest {
           typeof entry.checkpoint === 'number' ? entry.checkpoint : 0,
         snapshotPath:
           typeof entry.snapshotPath === 'string' ? entry.snapshotPath : '',
-        schema:
-          entry.schema && typeof entry.schema === 'object'
-            ? entry.schema
-            : undefined,
+        schema: isCollectionSchema(entry.schema) ? entry.schema : undefined,
         indexes,
         updatedAt: entry.updatedAt
       };
@@ -1015,6 +1072,219 @@ function isValueEqual(left: unknown, right: unknown): boolean {
     return left === right;
   }
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function applyDefaultsToDocument(doc: Document, schema: CollectionSchema): Document {
+  const record = doc as Record<string, unknown>;
+
+  for (const [field, definition] of Object.entries(schema.fields)) {
+    const value = record[field];
+    if (value === undefined && definition.default !== undefined) {
+      record[field] = cloneDocument(definition.default) as unknown;
+      continue;
+    }
+
+    if (definition.type === 'object' && isPlainObject(value)) {
+      record[field] = applyDefaultsToObject(
+        value as Record<string, unknown>,
+        definition.fields
+      );
+    } else if (definition.type === 'array' && Array.isArray(value)) {
+      record[field] = value.map((item) =>
+        applyDefaultsToValue(item, definition.items)
+      );
+    }
+  }
+
+  return record as Document;
+}
+
+function applyDefaultsToObject(
+  value: Record<string, unknown>,
+  fields: Record<string, FieldSchema>
+): Record<string, unknown> {
+  const clone = { ...value };
+  Object.entries(fields).forEach(([key, fieldSchema]) => {
+    if (clone[key] === undefined && fieldSchema.default !== undefined) {
+      clone[key] = cloneDocument(fieldSchema.default) as unknown;
+      return;
+    }
+
+    if (fieldSchema.type === 'object' && isPlainObject(clone[key])) {
+      clone[key] = applyDefaultsToObject(
+        clone[key] as Record<string, unknown>,
+        fieldSchema.fields
+      );
+    } else if (fieldSchema.type === 'array' && Array.isArray(clone[key])) {
+      clone[key] = (clone[key] as unknown[]).map((item) =>
+        applyDefaultsToValue(item, fieldSchema.items)
+      );
+    }
+  });
+
+  return clone;
+}
+
+function applyDefaultsToValue(value: unknown, schema: FieldSchema): unknown {
+  if (value === undefined && schema.default !== undefined) {
+    return cloneDocument(schema.default) as unknown;
+  }
+
+  if (schema.type === 'object' && isPlainObject(value)) {
+    return applyDefaultsToObject(
+      value as Record<string, unknown>,
+      schema.fields
+    );
+  }
+
+  if (schema.type === 'array' && Array.isArray(value)) {
+    return value.map((item) => applyDefaultsToValue(item, schema.items));
+  }
+
+  return value;
+}
+
+function validateDocumentAgainstSchema(
+  doc: Document,
+  schema: CollectionSchema
+): void {
+  const record = doc as Record<string, unknown>;
+  Object.keys(record).forEach((key) => {
+    if (key === '_id') {
+      return;
+    }
+    if (!schema.fields[key]) {
+      throw new Error(`Unexpected field '${key}' not defined in schema`);
+    }
+  });
+
+  Object.entries(schema.fields).forEach(([field, definition]) => {
+    const value = record[field];
+    validateField(`${field}`, value, definition);
+  });
+}
+
+function validateField(pathname: string, value: unknown, schema: FieldSchema): void {
+  if (value === undefined) {
+    if (schema.required) {
+      throw new Error(`Field '${pathname}' is required`);
+    }
+    return;
+  }
+
+  switch (schema.type) {
+    case 'string':
+      assertString(pathname, value);
+      if (schema.minLength !== undefined && (value as string).length < schema.minLength) {
+        throw new Error(
+          `Field '${pathname}' must be at least ${schema.minLength} characters`
+        );
+      }
+      if (schema.maxLength !== undefined && (value as string).length > schema.maxLength) {
+        throw new Error(
+          `Field '${pathname}' must be at most ${schema.maxLength} characters`
+        );
+      }
+      if (schema.pattern) {
+        const regex = new RegExp(schema.pattern);
+        if (!regex.test(value as string)) {
+          throw new Error(`Field '${pathname}' does not match pattern ${schema.pattern}`);
+        }
+      }
+      if (schema.enum && !schema.enum.includes(value as string)) {
+        throw new Error(
+          `Field '${pathname}' must be one of: ${schema.enum.join(', ')}`
+        );
+      }
+      break;
+    case 'number':
+      assertNumber(pathname, value);
+      if (schema.min !== undefined && (value as number) < schema.min) {
+        throw new Error(`Field '${pathname}' must be >= ${schema.min}`);
+      }
+      if (schema.max !== undefined && (value as number) > schema.max) {
+        throw new Error(`Field '${pathname}' must be <= ${schema.max}`);
+      }
+      if (schema.integer && !Number.isInteger(value as number)) {
+        throw new Error(`Field '${pathname}' must be an integer`);
+      }
+      break;
+    case 'boolean':
+      if (typeof value !== 'boolean') {
+        throw new Error(`Field '${pathname}' must be a boolean`);
+      }
+      break;
+    case 'date':
+      if (
+        !(typeof value === 'string' || value instanceof Date) ||
+        Number.isNaN(new Date(value as string | Date).getTime())
+      ) {
+        throw new Error(`Field '${pathname}' must be a valid date/ISO string`);
+      }
+      break;
+    case 'object':
+      if (!isPlainObject(value)) {
+        throw new Error(`Field '${pathname}' must be an object`);
+      }
+      validateNestedObject(pathname, value as Record<string, unknown>, schema.fields);
+      break;
+    case 'array':
+      if (!Array.isArray(value)) {
+        throw new Error(`Field '${pathname}' must be an array`);
+      }
+      if (schema.minItems !== undefined && value.length < schema.minItems) {
+        throw new Error(
+          `Field '${pathname}' must have at least ${schema.minItems} items`
+        );
+      }
+      if (schema.maxItems !== undefined && value.length > schema.maxItems) {
+        throw new Error(
+          `Field '${pathname}' must have at most ${schema.maxItems} items`
+        );
+      }
+      value.forEach((item, idx) => {
+        validateField(`${pathname}[${idx}]`, item, schema.items);
+      });
+      break;
+    case 'json':
+      // json accepts any value
+      break;
+    default:
+      throw new Error(`Field '${pathname}' has unsupported schema type`);
+  }
+}
+
+function validateNestedObject(
+  pathname: string,
+  value: Record<string, unknown>,
+  fields: Record<string, FieldSchema>
+): void {
+  Object.keys(value).forEach((key) => {
+    if (!fields[key]) {
+      throw new Error(`Unexpected field '${pathname}.${key}' not defined in schema`);
+    }
+  });
+
+  Object.entries(fields).forEach(([key, definition]) => {
+    const childValue = value[key];
+    validateField(`${pathname}.${key}`, childValue, definition);
+  });
+}
+
+function assertString(pathname: string, value: unknown): void {
+  if (typeof value !== 'string') {
+    throw new Error(`Field '${pathname}' must be a string`);
+  }
+}
+
+function assertNumber(pathname: string, value: unknown): void {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    throw new Error(`Field '${pathname}' must be a number`);
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function buildIndexEntries(

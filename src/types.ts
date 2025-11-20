@@ -12,6 +12,73 @@ export interface Document extends Record<string, unknown> {
   _id?: DocumentId;
 }
 
+export type FieldType =
+  | 'string'
+  | 'number'
+  | 'boolean'
+  | 'date'
+  | 'object'
+  | 'array'
+  | 'json';
+
+export interface BaseFieldSchema {
+  type: FieldType;
+  required?: boolean;
+  default?: JsonValue;
+}
+
+export interface StringFieldSchema extends BaseFieldSchema {
+  type: 'string';
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
+  enum?: string[];
+}
+
+export interface NumberFieldSchema extends BaseFieldSchema {
+  type: 'number';
+  min?: number;
+  max?: number;
+  integer?: boolean;
+}
+
+export interface BooleanFieldSchema extends BaseFieldSchema {
+  type: 'boolean';
+}
+
+export interface DateFieldSchema extends BaseFieldSchema {
+  type: 'date';
+}
+
+export interface ObjectFieldSchema extends BaseFieldSchema {
+  type: 'object';
+  fields: Record<string, FieldSchema>;
+}
+
+export interface ArrayFieldSchema extends BaseFieldSchema {
+  type: 'array';
+  items: FieldSchema;
+  minItems?: number;
+  maxItems?: number;
+}
+
+export interface JsonFieldSchema extends BaseFieldSchema {
+  type: 'json';
+}
+
+export type FieldSchema =
+  | StringFieldSchema
+  | NumberFieldSchema
+  | BooleanFieldSchema
+  | DateFieldSchema
+  | ObjectFieldSchema
+  | ArrayFieldSchema
+  | JsonFieldSchema;
+
+export interface CollectionSchema {
+  fields: Record<string, FieldSchema>;
+}
+
 export interface Filter {
   [key: string]: unknown;
 }
@@ -91,6 +158,7 @@ export interface DatabaseOptions {
   fsync?: 'always' | 'batch' | 'never';
   indexDir?: string;
   tokenizer?: Partial<TokenizerOptions>;
+  schemas?: Record<string, CollectionSchema>;
 }
 
 export interface Database {

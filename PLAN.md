@@ -9,6 +9,10 @@
 - Logging is always on (structured JSON logs).
 - Targeted for drop-in use in Node.js 22.x backends (Express/Next.js/Electron/etc).
 
+## Progress Notes
+
+- Core schema validation implemented: schemas provided at init are stored in the manifest, defaults applied on insert, unexpected fields rejected, and type/constraint checks run on insert/update and during compaction.
+
 ## High-Level Design
 
 - **Collections**: Each collection stored as append-only JSONL log (`data/<collection>.jsonl`) plus compacted snapshot (`data/<collection>.snapshot.json`). Each line is `{_id, data, meta}` for writes, or `{_id, tombstone:true}` for deletes.

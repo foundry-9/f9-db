@@ -339,4 +339,63 @@ describe('JsonFileDatabase', () => {
       1
     );
   });
+
+  test('schema validation enforces types, required fields, and defaults', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({
+      dataDir,
+      binaryDir,
+      schemas: {
+        users: {
+          fields: {
+            name: { type: 'string', required: true, minLength: 2 },
+            age: { type: 'number', min: 0 },
+            active: { type: 'boolean', default: true },
+            tags: {
+              type: 'array',
+              required: true,
+              minItems: 1,
+              items: { type: 'string' }
+            },
+            profile: {
+              type: 'object',
+              required: true,
+              fields: { city: { type: 'string', required: true } }
+            }
+          }
+        }
+      }
+    });
+
+    const saved = await db.insert('users', {
+      name: 'Ada',
+      age: 32,
+      tags: ['math'],
+      profile: { city: 'London' }
+    });
+    expect(saved.active).toBe(true);
+
+    await expect(
+      db.insert('users', {
+        age: 10,
+        tags: ['kid'],
+        profile: { city: 'NYC' }
+      })
+    ).rejects.toThrow(/Field 'name' is required/);
+
+    await expect(
+      db.insert('users', {
+        name: 'Bo',
+        age: 5,
+        tags: [],
+        profile: { city: 'SF' }
+      })
+    ).rejects.toThrow(/must have at least 1 items/);
+
+    await expect(
+      db.update('users', saved._id as string, {
+        age: 'old' as unknown as number
+      })
+    ).rejects.toThrow(/must be a number/);
+  });
 });
