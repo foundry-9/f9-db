@@ -35,6 +35,7 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 - Relations: `join(collection, doc, relations)` resolves foreign refs into nested objects/arrays with batching to avoid N+1.
 
 ## Schema & Constraints
+
 - Rigid schema per collection/table; all fields declared up-front except one flexible `json` type for arbitrary payloads.
 - Types: string, number, boolean, date/iso-string, binary ref, arrays/objects with typed children (unless declared `json`).
 - Constraints: required/not-null, defaults, string min/max/regex/enum, number min/max/integer-only, array item type + length bounds, object nested validation.
@@ -79,6 +80,7 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 - Dedup: `dedupeBinaries` default true (sha256), can disable
 
 ## Locking & Concurrency Defaults
+
 - Single-writer lock via JS lockfile with retry/backoff for portability.
 - Optional `lockMode: "lockfile" | "flock"` flag; default is lockfile, `flock` opt-in when available.
 
