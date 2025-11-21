@@ -86,7 +86,7 @@ describe('JsonFileDatabase', () => {
     expect(sorted.map((u) => u.name)).toEqual(['Ada', 'Bob']);
   });
 
-  test('stream yields matching documents respecting limit/skip', async () => {
+  test('stream yields JSONL strings respecting limit/skip', async () => {
     ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
 
@@ -100,10 +100,36 @@ describe('JsonFileDatabase', () => {
       {},
       { sort: { age: -1 }, skip: 1, limit: 1 }
     )) {
-      seen.push(doc.name as string);
+      const parsed = JSON.parse(doc);
+      seen.push(parsed.name as string);
     }
 
     expect(seen).toEqual(['Ada']);
+  });
+
+  test('stream sorts with bounded buffer and emits JSONL', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    const total = 2000;
+    for (let idx = 0; idx < total; idx += 1) {
+      await db.insert('items', { order: total - idx });
+    }
+
+    let maxBufferedDocs = 0;
+    const diagnostics = (stats: { maxBufferedDocs: number; scannedDocs: number }) => {
+      maxBufferedDocs = stats.maxBufferedDocs;
+      expect(stats.scannedDocs).toBe(total);
+    };
+
+    const results: number[] = [];
+    for await (const line of db.stream('items', {}, { sort: { order: 1 }, skip: 5, limit: 10, diagnostics })) {
+      const parsed = JSON.parse(line);
+      results.push(parsed.order as number);
+    }
+
+    expect(results).toEqual([6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    expect(maxBufferedDocs).toBeLessThanOrEqual(15);
   });
 
   test('auto snapshots after the configured write interval', async () => {

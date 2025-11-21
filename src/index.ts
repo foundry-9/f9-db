@@ -301,32 +301,71 @@ class JsonFileDatabase implements Database {
     collection: string,
     filter: Filter = {},
     options: FindOptions = {}
-  ): AsyncIterable<Document> {
+  ): AsyncIterable<string> {
     const state = await this.loadCollection(collection);
-    const { limit = Infinity, skip = 0, sort } = options;
+    const { limit = Infinity, skip = 0, sort, diagnostics } = options;
     const sortKeys = sort ? Object.keys(sort) : [];
+    const stats = {
+      scannedDocs: 0,
+      matchedDocs: 0,
+      yieldedDocs: 0,
+      maxBufferedDocs: 0
+    };
+
     const candidates = await this.getIndexedCandidates(collection, filter, state);
-    const docsToScan = candidates
-      ? Array.from(candidates)
-          .map((id) => state.docs.get(id))
-          .filter(Boolean) as Document[]
-      : Array.from(state.docs.values());
-    let results = docsToScan.filter((doc) => matchesFilter(doc, filter));
+    const docsToScan =
+      candidates !== null
+        ? iterateCandidateDocs(state, candidates)
+        : state.docs.values();
 
-    if (sortKeys.length > 0) {
-      results = results.sort((left, right) =>
-        compareDocuments(left, right, sort as Record<string, 1 | -1>)
-      );
-    }
+    try {
+      if (sortKeys.length === 0) {
+        let yielded = 0;
+        let skipped = 0;
+        for (const doc of docsToScan) {
+          stats.scannedDocs += 1;
+          if (!matchesFilter(doc, filter)) {
+            continue;
+          }
+          stats.matchedDocs += 1;
+          if (skipped < skip) {
+            skipped += 1;
+            continue;
+          }
+          if (yielded >= limit) {
+            break;
+          }
+          yield `${JSON.stringify(cloneDocument(doc))}\n`;
+          yielded += 1;
+          stats.yieldedDocs = yielded;
+        }
+      } else {
+        const maxResults = Number.isFinite(limit) ? limit + skip : Infinity;
+        const compare = (left: Document, right: Document) =>
+          compareDocuments(left, right, sort as Record<string, 1 | -1>);
+        const buffer: Document[] = [];
+        for (const doc of docsToScan) {
+          stats.scannedDocs += 1;
+          if (!matchesFilter(doc, filter)) {
+            continue;
+          }
+          stats.matchedDocs += 1;
+          insertSortedBounded(buffer, doc, compare, maxResults);
+          if (buffer.length > stats.maxBufferedDocs) {
+            stats.maxBufferedDocs = buffer.length;
+          }
+        }
 
-    let yielded = 0;
-    for (let idx = 0; idx < results.length && yielded < limit; idx += 1) {
-      if (idx < skip) {
-        continue;
+        const start = skip;
+        const end = Number.isFinite(limit) ? start + limit : buffer.length;
+        const finalBuffer = buffer.slice(start, Math.min(end, buffer.length));
+        stats.yieldedDocs = finalBuffer.length;
+        for (const doc of finalBuffer) {
+          yield `${JSON.stringify(cloneDocument(doc))}\n`;
+        }
       }
-
-      yield cloneDocument(results[idx]);
-      yielded += 1;
+    } finally {
+      diagnostics?.({ ...stats });
     }
   }
 
@@ -1355,6 +1394,19 @@ function resolveOptions(options: DatabaseOptions): ResolvedOptions {
   };
 }
 
+function* iterateCandidateDocs(
+  state: CollectionState,
+  candidates: Set<DocumentId>
+): Iterable<Document> {
+  for (const id of candidates) {
+    const doc = state.docs.get(id);
+    if (!doc) {
+      continue;
+    }
+    yield doc;
+  }
+}
+
 interface NormalizedJoin {
   key: string;
   relation: JoinRelation;
@@ -2367,6 +2419,49 @@ function compareDocuments(
   }
 
   return 0;
+}
+
+function insertSortedBounded(
+  buffer: Document[],
+  doc: Document,
+  compare: (left: Document, right: Document) => number,
+  capacity: number
+): void {
+  if (capacity === 0) {
+    return;
+  }
+
+  if (!Number.isFinite(capacity) || buffer.length === 0) {
+    const idx = findInsertIndex(buffer, doc, compare);
+    buffer.splice(idx, 0, doc);
+    return;
+  }
+
+  const idx = findInsertIndex(buffer, doc, compare);
+  buffer.splice(idx, 0, doc);
+  if (buffer.length > capacity) {
+    buffer.pop();
+  }
+}
+
+function findInsertIndex(
+  buffer: Document[],
+  doc: Document,
+  compare: (left: Document, right: Document) => number
+): number {
+  let low = 0;
+  let high = buffer.length;
+
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (compare(doc, buffer[mid] as Document) < 0) {
+      high = mid;
+    } else {
+      low = mid + 1;
+    }
+  }
+
+  return low;
 }
 
 function cloneDocument<T>(doc: T): T {

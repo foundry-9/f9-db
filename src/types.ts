@@ -89,6 +89,7 @@ export interface FindOptions {
   skip?: number;
   sort?: Record<string, 1 | -1>;
   stream?: boolean;
+  diagnostics?: (stats: StreamDiagnostics) => void;
 }
 
 export interface IndexOptions {
@@ -169,6 +170,13 @@ export interface BinaryDeleteOptions {
   force?: boolean;
 }
 
+export interface StreamDiagnostics {
+  scannedDocs: number;
+  matchedDocs: number;
+  yieldedDocs: number;
+  maxBufferedDocs: number;
+}
+
 export interface Logger {
   debug?: (msg: string, context?: Record<string, unknown>) => void;
   info?: (msg: string, context?: Record<string, unknown>) => void;
@@ -214,7 +222,7 @@ export interface Database {
     collection: string,
     filter?: Filter,
     options?: FindOptions
-  ) => AsyncIterable<Document>;
+  ) => AsyncIterable<string>;
   ensureIndex: (
     collection: string,
     field: string,
