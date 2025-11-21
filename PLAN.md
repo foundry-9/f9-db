@@ -24,7 +24,7 @@
   - CRUD: `insert(collection, doc)`, `get(collection, id)`, `update(collection, id, mutation)`, `remove(collection, id)`.
   - Query: `find(collection, filter, opts)`, `stream(collection, filter, opts) -> AsyncIterator` (yields JSONL).
   - Index mgmt: `ensureIndex(collection, field, options)`, `rebuildIndex`.
-  - Relational helpers: `join(collection, doc, relations)` that pulls referenced docs into nested shapes.
+  - Relational helpers: `join(collection, doc, relations)` that pulls referenced docs into nested shapes with configurable cache size/TTL and manual `clearJoinCache`.
 - **Output formats**:
   - Default `find` returns JSON array/object.
   - `stream`/`export` returns UTF-8 JSONL chunked results for large scans.

@@ -557,4 +557,31 @@ describe('JsonFileDatabase', () => {
     });
     expect(afterExpiry.author).toEqual({ _id: alice._id, name: 'Alice new' });
   });
+
+  test('clearJoinCache manually flushes cached relations', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    const alice = await db.insert('users', { name: 'Alice' });
+    const post = await db.insert('posts', { authorId: alice._id });
+
+    const first = await db.join('posts', post, {
+      author: { localField: 'authorId', foreignCollection: 'users', projection: ['name'] }
+    });
+    expect(first.author).toEqual({ _id: alice._id, name: 'Alice' });
+
+    await db.update('users', alice._id as string, { name: 'Alice updated' });
+    const cached = await db.join('posts', post, {
+      author: { localField: 'authorId', foreignCollection: 'users', projection: ['name'] }
+    });
+    expect(cached.author).toEqual({ _id: alice._id, name: 'Alice updated' });
+    await db.update('users', alice._id as string, { name: 'Alice final' });
+
+    db.clearJoinCache();
+
+    const refreshed = await db.join('posts', post, {
+      author: { localField: 'authorId', foreignCollection: 'users', projection: ['name'] }
+    });
+    expect(refreshed.author).toEqual({ _id: alice._id, name: 'Alice final' });
+  });
 });

@@ -32,7 +32,7 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 - CRUD: `insert(collection, doc)`, `get(collection, id)`, `update(collection, id, mutation)`, `remove(collection, id)`.
 - Query: `find(collection, filter, opts)` (JSON result), `stream(collection, filter, opts)` (AsyncIterator yielding JSONL).
 - Index mgmt: `ensureIndex(collection, field, options)`, `rebuildIndex`.
-- Relations: `join(collection, doc, relations)` resolves foreign refs into nested objects/arrays with batching to avoid N+1.
+- Relations: `join(collection, doc, relations)` resolves foreign refs into nested objects/arrays with batching to avoid N+1. Cache size/TTL are configurable; call `clearJoinCache()` to flush manually.
 
 ## Schema & Constraints
 
@@ -71,6 +71,7 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 ## Configuration Highlights
 
 - Paths: `dataDir`, `binaryDir`, `logDir`
+- Join cache: `joinCacheMaxEntries` (default 1000), `joinCacheTTLms` (default none/Infinity), `clearJoinCache()` to flush manually
 - Compaction: `autoCompact`, `compactInterval`, `maxLogBytes`
 - Durability: `fsync` = `always | batch | never`
 - Index: tokenizer (lowercase + non-alpha split, min length 2, no stemming by default), prefix length, optional stopwords, custom tokenizer hook

@@ -194,4 +194,5 @@ export interface Database {
     relations: JoinRelations
   ) => Promise<Document>;
   compact: (collection: string) => Promise<void>;
+  clearJoinCache: () => void;
 }

@@ -107,7 +107,7 @@ class JsonFileDatabase implements Database {
     state.docs.set(_id, normalized);
     await this.appendLog(collection, state, { _id, data: normalized });
     await this.refreshIndexesForWrite(collection, state, normalized, null);
-    this.clearJoinCache();
+    this.resetJoinCache();
     return cloneDocument(normalized);
   }
 
@@ -139,7 +139,7 @@ class JsonFileDatabase implements Database {
     state.docs.set(id, normalized);
     await this.appendLog(collection, state, { _id: id, data: normalized });
     await this.refreshIndexesForWrite(collection, state, normalized, existing);
-    this.clearJoinCache();
+    this.resetJoinCache();
     return cloneDocument(normalized);
   }
 
@@ -154,7 +154,7 @@ class JsonFileDatabase implements Database {
     state.docs.delete(id);
     await this.appendLog(collection, state, { _id: id, tombstone: true });
     await this.refreshIndexesForWrite(collection, state, null, existing);
-    this.clearJoinCache();
+    this.resetJoinCache();
   }
 
   async find(
@@ -355,6 +355,10 @@ class JsonFileDatabase implements Database {
   async compact(collection: string): Promise<void> {
     const state = await this.loadCollection(collection);
     await this.compactCollection(collection, state);
+  }
+
+  clearJoinCache(): void {
+    this.resetJoinCache();
   }
 
   private async loadCollection(collection: string): Promise<CollectionState> {
@@ -903,7 +907,7 @@ class JsonFileDatabase implements Database {
     return bucket;
   }
 
-  private clearJoinCache(): void {
+  private resetJoinCache(): void {
     this.joinCache.clear();
   }
 
