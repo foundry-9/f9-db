@@ -119,6 +119,10 @@ export interface FindOptions {
   skip?: number;
   sort?: Record<string, 1 | -1>;
   projection?: string[];
+  groupBy?: string[];
+  aggregates?: Record<string, AggregateDefinition>;
+  partitionBy?: string[];
+  rowNumber?: boolean | RowNumberOptions;
   stream?: boolean;
   /**
    * When true, `stream` reads directly from snapshot/log files instead of loading the in-memory collection map.
@@ -126,6 +130,18 @@ export interface FindOptions {
    */
   streamFromFiles?: boolean;
   diagnostics?: (stats: StreamDiagnostics) => void;
+}
+
+export type AggregateOperator = 'count' | 'sum' | 'avg' | 'min' | 'max';
+
+export interface AggregateDefinition {
+  op: AggregateOperator;
+  field?: string;
+}
+
+export interface RowNumberOptions {
+  as?: string;
+  orderBy?: Record<string, 1 | -1>;
 }
 
 export interface IndexOptions {

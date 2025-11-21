@@ -131,6 +131,56 @@ describe('JsonFileDatabase', () => {
     expect(notIn.map((user) => user.name).sort()).toEqual(['Ada Lovelace', 'dave']);
   });
 
+  test('find groups rows with aggregates similar to SQL GROUP BY', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    await db.insert('orders', { status: 'open', amount: 50 });
+    await db.insert('orders', { status: 'open', amount: 100 });
+    await db.insert('orders', { status: 'closed', amount: 75 });
+
+    const grouped = await db.find('orders', {}, {
+      groupBy: ['status'],
+      aggregates: {
+        totalAmount: { op: 'sum', field: 'amount' },
+        averageAmount: { op: 'avg', field: 'amount' },
+        orderCount: { op: 'count' },
+        largest: { op: 'max', field: 'amount' }
+      },
+      sort: { status: 1 }
+    });
+
+    expect(grouped).toEqual([
+      { status: 'closed', totalAmount: 75, averageAmount: 75, orderCount: 1, largest: 75 },
+      { status: 'open', totalAmount: 150, averageAmount: 75, orderCount: 2, largest: 100 }
+    ]);
+  });
+
+  test('find assigns row numbers within partitions similar to SQL window functions', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    await db.insert('users', { name: 'Ada', city: 'London', score: 98 });
+    await db.insert('users', { name: 'Bob', city: 'London', score: 82 });
+    await db.insert('users', { name: 'Carol', city: 'Lisbon', score: 91 });
+    await db.insert('users', { name: 'Dave', city: 'Lisbon', score: 78 });
+    await db.insert('users', { name: 'Eve', city: 'Lisbon', score: 88 });
+
+    const ranked = await db.find('users', {}, {
+      partitionBy: ['city'],
+      rowNumber: { as: 'rowNumber', orderBy: { score: -1 } },
+      sort: { city: 1, score: -1 }
+    });
+
+    const london = ranked.filter((user) => user.city === 'London');
+    expect(london.map((user) => user.name)).toEqual(['Ada', 'Bob']);
+    expect(london.map((user) => user.rowNumber)).toEqual([1, 2]);
+
+    const lisbon = ranked.filter((user) => user.city === 'Lisbon');
+    expect(lisbon.map((user) => user.name)).toEqual(['Carol', 'Eve', 'Dave']);
+    expect(lisbon.map((user) => user.rowNumber)).toEqual([1, 2, 3]);
+  });
+
   test('stream yields JSONL strings respecting limit/skip', async () => {
     ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });

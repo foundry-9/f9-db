@@ -22,7 +22,9 @@ import type {
   BinaryMetadata,
   BinaryWriteOptions,
   BinaryDeleteOptions,
-  BinaryReference
+  BinaryReference,
+  AggregateDefinition,
+  RowNumberOptions
 } from './types.js';
 
 interface ResolvedOptions extends DatabaseOptions {
@@ -276,8 +278,18 @@ class JsonFileDatabase implements Database {
     options: FindOptions = {}
   ): Promise<Document[]> {
     const state = await this.loadCollection(collection);
-    const { limit = Infinity, skip = 0, sort, projection } = options;
+    const {
+      limit = Infinity,
+      skip = 0,
+      sort,
+      projection,
+      groupBy,
+      aggregates,
+      partitionBy,
+      rowNumber
+    } = options;
     const sortKeys = sort ? Object.keys(sort) : [];
+    const normalizedRowNumber = normalizeRowNumberOptions(rowNumber);
 
     const candidates = await this.getIndexedCandidates(collection, filter, state);
     const docsToScan = candidates
@@ -287,8 +299,22 @@ class JsonFileDatabase implements Database {
       : Array.from(state.docs.values());
 
     let results = docsToScan.filter((doc) => matchesFilter(doc, filter));
+    const groupingRequested =
+      (Array.isArray(groupBy) && groupBy.length > 0) ||
+      (aggregates && Object.keys(aggregates).length > 0);
 
-    if (sortKeys.length > 0) {
+    if (groupingRequested) {
+      results = groupDocuments(results, groupBy ?? [], aggregates);
+    }
+
+    if (normalizedRowNumber) {
+      results = applyRowNumber(
+        results,
+        partitionBy ?? [],
+        sort,
+        normalizedRowNumber
+      );
+    } else if (sortKeys.length > 0) {
       results = results.sort((left, right) =>
         compareDocuments(left, right, sort as Record<string, 1 | -1>)
       );
@@ -2850,6 +2876,250 @@ function toIndexableValues(predicate: unknown): string[] | null {
   }
 
   return typeof predicate === 'string' ? [predicate] : null;
+}
+
+function normalizeRowNumberOptions(
+  rowNumber?: boolean | RowNumberOptions
+): RowNumberOptions | null {
+  if (rowNumber === undefined || rowNumber === false) {
+    return null;
+  }
+
+  if (rowNumber === true) {
+    return {};
+  }
+
+  return typeof rowNumber === 'object' ? rowNumber : null;
+}
+
+function groupDocuments(
+  docs: Document[],
+  groupBy: string[],
+  aggregates?: Record<string, AggregateDefinition>
+): Document[] {
+  const aggregateDefs = normalizeAggregates(aggregates);
+  const groupKeyFields = Array.isArray(groupBy) ? groupBy : [];
+  const buckets = new Map<string, { keys: Record<string, unknown>; rows: Document[] }>();
+
+  docs.forEach((doc) => {
+    const keyValues: Record<string, unknown> = {};
+    groupKeyFields.forEach((field) => {
+      const value = getValueAtPath(doc as Record<string, unknown>, field);
+      if (value !== undefined) {
+        keyValues[field] = cloneDocument(value) as unknown;
+      }
+    });
+    const key = serializeKeyForFields(keyValues, groupKeyFields);
+    const existing = buckets.get(key);
+    if (existing) {
+      existing.rows.push(doc);
+    } else {
+      buckets.set(key, { keys: keyValues, rows: [doc] });
+    }
+  });
+
+  if (buckets.size === 0 && groupKeyFields.length === 0) {
+    buckets.set('__all__', { keys: {}, rows: [] });
+  }
+
+  const results: Document[] = [];
+  buckets.forEach(({ keys, rows }) => {
+    const aggregatesForGroup = computeAggregates(rows, aggregateDefs);
+    results.push({ ...keys, ...aggregatesForGroup });
+  });
+
+  return results;
+}
+
+function normalizeAggregates(
+  aggregates?: Record<string, AggregateDefinition>
+): Record<string, AggregateDefinition> {
+  if (!aggregates || Object.keys(aggregates).length === 0) {
+    return { count: { op: 'count' } };
+  }
+
+  const normalized: Record<string, AggregateDefinition> = {};
+  Object.entries(aggregates).forEach(([alias, spec]) => {
+    if (!spec || typeof spec.op !== 'string') {
+      throw new Error(`Invalid aggregate definition for '${alias}'`);
+    }
+
+    if (spec.op !== 'count' && (!spec.field || typeof spec.field !== 'string')) {
+      throw new Error(`Aggregate '${alias}' with op '${spec.op}' requires a field`);
+    }
+
+    normalized[alias] = spec;
+  });
+
+  return normalized;
+}
+
+function computeAggregates(
+  rows: Document[],
+  aggregates: Record<string, AggregateDefinition>
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+
+  Object.entries(aggregates).forEach(([alias, spec]) => {
+    switch (spec.op) {
+      case 'count':
+        result[alias] = rows.length;
+        break;
+      case 'sum': {
+        const numbers = extractNumericValues(rows, spec.field as string);
+        const sum = numbers.reduce((acc, value) => acc + value, 0);
+        result[alias] = sum;
+        break;
+      }
+      case 'avg': {
+        const numbers = extractNumericValues(rows, spec.field as string);
+        const sum = numbers.reduce((acc, value) => acc + value, 0);
+        result[alias] = numbers.length > 0 ? sum / numbers.length : null;
+        break;
+      }
+      case 'min': {
+        result[alias] = extractExtremum(rows, spec.field as string, 'min');
+        break;
+      }
+      case 'max': {
+        result[alias] = extractExtremum(rows, spec.field as string, 'max');
+        break;
+      }
+      default:
+        throw new Error(`Unsupported aggregate op '${(spec as AggregateDefinition).op}'`);
+    }
+  });
+
+  return result;
+}
+
+function extractNumericValues(rows: Document[], field: string): number[] {
+  return rows
+    .map((row) => getValueAtPath(row as Record<string, unknown>, field))
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+}
+
+function extractExtremum(
+  rows: Document[],
+  field: string,
+  mode: 'min' | 'max'
+): unknown {
+  let best: unknown;
+  rows.forEach((row) => {
+    const value = getValueAtPath(row as Record<string, unknown>, field);
+    if (!isComparableAggregateValue(value)) {
+      return;
+    }
+
+    if (best === undefined) {
+      best = value;
+      return;
+    }
+
+    const comparison = compareValues(value, best);
+    if (comparison === null) {
+      return;
+    }
+
+    if ((mode === 'min' && comparison < 0) || (mode === 'max' && comparison > 0)) {
+      best = value;
+    }
+  });
+
+  if (best instanceof Date) {
+    return new Date(best.getTime());
+  }
+
+  return best ?? null;
+}
+
+function isComparableAggregateValue(
+  value: unknown
+): value is string | number | boolean | Date | null {
+  return (
+    value instanceof Date ||
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    value === null
+  );
+}
+
+function serializeKeyForFields(
+  keyValues: Record<string, unknown>,
+  fields: string[]
+): string {
+  if (!fields || fields.length === 0) {
+    return '__all__';
+  }
+
+  return fields
+    .map((field) => `${field}:${JSON.stringify(keyValues[field])}`)
+    .join('|');
+}
+
+function applyRowNumber(
+  docs: Document[],
+  partitionBy: string[],
+  sort: Record<string, 1 | -1> | undefined,
+  options: RowNumberOptions
+): Document[] {
+  const as = options.as && options.as.trim().length > 0 ? options.as : '_rowNumber';
+  const partitionFields = Array.isArray(partitionBy) && partitionBy.length > 0 ? partitionBy : [];
+  const orderForNumbering = options.orderBy ?? sort;
+  const orderedDocs =
+    orderForNumbering && docs.length > 1
+      ? [...docs].sort((left, right) => compareDocuments(left, right, orderForNumbering))
+      : [...docs];
+
+  const counters = new Map<string, number>();
+  const numbered = orderedDocs.map((doc) => {
+    const key = serializePartitionKey(doc, partitionFields);
+    const next = (counters.get(key) ?? 0) + 1;
+    counters.set(key, next);
+    const clone = cloneDocument(doc);
+    (clone as Record<string, unknown>)[as] = next;
+    return clone;
+  });
+
+  if (sort && orderForNumbering && !sortOrdersEqual(sort, orderForNumbering)) {
+    return numbered.sort((left, right) => compareDocuments(left, right, sort));
+  }
+
+  if (sort && !orderForNumbering) {
+    return numbered.sort((left, right) => compareDocuments(left, right, sort));
+  }
+
+  return numbered;
+}
+
+function serializePartitionKey(doc: Document, fields: string[]): string {
+  if (fields.length === 0) {
+    return '__all__';
+  }
+
+  const values = fields.map((field) => {
+    const value = getValueAtPath(doc as Record<string, unknown>, field);
+    return `${field}:${JSON.stringify(value)}`;
+  });
+  return values.join('|');
+}
+
+function sortOrdersEqual(
+  left: Record<string, 1 | -1> | undefined,
+  right: Record<string, 1 | -1> | undefined
+): boolean {
+  if (!left || !right) {
+    return false;
+  }
+
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+
+  return leftKeys.every((key) => left[key] === right[key]);
 }
 
 function compareDocuments(

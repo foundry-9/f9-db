@@ -33,8 +33,24 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 - Query: `find(collection, filter, opts)` (JSON result), `stream(collection, filter, opts)` (AsyncIterator yielding JSONL).
   - Filters support SQL-style predicates: direct equality, `$gt/$gte/$lt/$lte`, `$between`, `$in/$nin`, `$like/$ilike`, `$isNull/$exists`, and boolean `$and/$or/$not`. Arrays remain shorthand for `IN`.
   - Projections: `projection: ['name', 'profile.city']` trims fields before returning/streaming (always includes `_id`).
+  - Aggregations: `groupBy` + `aggregates` (count/sum/avg/min/max) return grouped rows; `partitionBy` + `rowNumber` mirrors `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)`.
 - Index mgmt: `ensureIndex(collection, field, options)`, `rebuildIndex`.
 - Relations: `join(collection, doc, relations)` resolves foreign refs into nested objects/arrays with batching to avoid N+1. Cache size/TTL are configurable; call `clearJoinCache()` to flush manually.
+
+Example aggregations:
+
+```ts
+await db.find('orders', {}, {
+  groupBy: ['status'],
+  aggregates: { total: { op: 'sum', field: 'amount' }, orderCount: { op: 'count' } }
+});
+
+await db.find('users', {}, {
+  partitionBy: ['team'],
+  rowNumber: { as: 'rank', orderBy: { score: -1 } },
+  sort: { team: 1, score: -1 }
+});
+```
 
 ## Schema & Constraints
 
