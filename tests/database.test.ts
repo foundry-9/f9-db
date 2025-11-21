@@ -132,6 +132,29 @@ describe('JsonFileDatabase', () => {
     expect(maxBufferedDocs).toBeLessThanOrEqual(15);
   });
 
+  test('stream can scan directly from files without loading collection map', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    const writer = createDatabase({ dataDir, binaryDir, snapshotInterval: 0 });
+
+    const ada = await writer.insert('users', { name: 'Ada' });
+    await writer.insert('users', { name: 'Bob' });
+    await writer.update('users', ada._id as string, { name: 'Ada Lovelace' });
+    const removeMe = await writer.insert('users', { name: 'Temp' });
+    await writer.remove('users', removeMe._id as string);
+
+    const reader = createDatabase({ dataDir, binaryDir });
+    const names: string[] = [];
+    for await (const line of reader.stream('users', {}, { streamFromFiles: true })) {
+      const parsed = JSON.parse(line);
+      names.push(parsed.name as string);
+    }
+
+    expect(names.sort()).toEqual(['Ada Lovelace', 'Bob']);
+    expect(((reader as unknown as { collections?: Map<string, unknown> }).collections?.size) ?? 0).toBe(
+      0
+    );
+  });
+
   test('auto snapshots after the configured write interval', async () => {
     ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({

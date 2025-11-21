@@ -302,8 +302,7 @@ class JsonFileDatabase implements Database {
     filter: Filter = {},
     options: FindOptions = {}
   ): AsyncIterable<string> {
-    const state = await this.loadCollection(collection);
-    const { limit = Infinity, skip = 0, sort, diagnostics } = options;
+    const { limit = Infinity, skip = 0, sort, diagnostics, streamFromFiles } = options;
     const sortKeys = sort ? Object.keys(sort) : [];
     const stats = {
       scannedDocs: 0,
@@ -312,17 +311,23 @@ class JsonFileDatabase implements Database {
       maxBufferedDocs: 0
     };
 
-    const candidates = await this.getIndexedCandidates(collection, filter, state);
-    const docsToScan =
-      candidates !== null
-        ? iterateCandidateDocs(state, candidates)
-        : state.docs.values();
+    const docsToScan: AsyncIterable<Document> = streamFromFiles
+      ? this.streamDocsFromFiles(collection)
+      : toAsyncIterable(
+          await (async () => {
+            const state = await this.loadCollection(collection);
+            const candidates = await this.getIndexedCandidates(collection, filter, state);
+            return candidates !== null
+              ? iterateCandidateDocs(state, candidates)
+              : state.docs.values();
+          })()
+        );
 
     try {
       if (sortKeys.length === 0) {
         let yielded = 0;
         let skipped = 0;
-        for (const doc of docsToScan) {
+        for await (const doc of docsToScan) {
           stats.scannedDocs += 1;
           if (!matchesFilter(doc, filter)) {
             continue;
@@ -344,7 +349,7 @@ class JsonFileDatabase implements Database {
         const compare = (left: Document, right: Document) =>
           compareDocuments(left, right, sort as Record<string, 1 | -1>);
         const buffer: Document[] = [];
-        for (const doc of docsToScan) {
+        for await (const doc of docsToScan) {
           stats.scannedDocs += 1;
           if (!matchesFilter(doc, filter)) {
             continue;
@@ -717,6 +722,43 @@ class JsonFileDatabase implements Database {
     state.loaded = true;
     this.collections.set(collection, state);
     return state;
+  }
+
+  private async *streamDocsFromFiles(collection: string): AsyncGenerator<Document> {
+    const snapshotPath = path.join(this.options.dataDir, `${collection}.snapshot.json`);
+    await this.ensureManifestEntry(collection, snapshotPath);
+    const manifest = await this.getManifest();
+    const manifestEntry = manifest.collections[collection];
+    const logPath = path.join(this.options.dataDir, `${collection}.jsonl`);
+    const checkpoint = manifestEntry?.checkpoint ?? 0;
+    const overrides = await readLogOverrides(logPath, checkpoint);
+    const snapshotIterator = streamSnapshotDocs(
+      manifestEntry?.snapshotPath ?? snapshotPath
+    );
+
+    for await (const doc of snapshotIterator) {
+      const id = doc._id as DocumentId | undefined;
+      if (!id) {
+        continue;
+      }
+
+      const override = overrides.get(id);
+      if (override) {
+        overrides.delete(id);
+        if (!override.tombstone && override.doc) {
+          yield override.doc;
+        }
+        continue;
+      }
+
+      yield doc;
+    }
+
+    for (const override of overrides.values()) {
+      if (!override.tombstone && override.doc) {
+        yield override.doc;
+      }
+    }
   }
 
   private async appendLog(
@@ -1405,6 +1447,16 @@ function* iterateCandidateDocs(
     }
     yield doc;
   }
+}
+
+function toAsyncIterable<T>(iterable: Iterable<T>): AsyncIterable<T> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for (const value of iterable) {
+        yield value;
+      }
+    }
+  };
 }
 
 interface NormalizedJoin {
@@ -2232,6 +2284,129 @@ function countBinaryRefs(
   return counts;
 }
 
+type LogEntry = { _id?: DocumentId; data?: Document; tombstone?: boolean };
+
+async function readLogOverrides(
+  logPath: string,
+  offset: number
+): Promise<Map<DocumentId, { doc?: Document; tombstone?: boolean }>> {
+  const overrides = new Map<DocumentId, { doc?: Document; tombstone?: boolean }>();
+  const size = await getFileSize(logPath);
+
+  if (offset >= size) {
+    return overrides;
+  }
+
+  for await (const entry of streamLogEntries(logPath, offset)) {
+    if (!entry?._id) {
+      continue;
+    }
+
+    if (entry.tombstone) {
+      overrides.set(entry._id, { tombstone: true });
+      continue;
+    }
+
+    if (entry.data) {
+      overrides.set(entry._id, { doc: entry.data });
+    }
+  }
+
+  return overrides;
+}
+
+async function* streamSnapshotDocs(filePath: string): AsyncGenerator<Document> {
+  try {
+    let buffer = '';
+    let inString = false;
+    let escaped = false;
+    let arrayStarted = false;
+    let braceDepth = 0;
+    let objectStart = -1;
+    const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
+
+    for await (const chunk of stream) {
+      buffer += chunk;
+
+      if (!arrayStarted) {
+        const startIndex = buffer.indexOf('[');
+        if (startIndex === -1) {
+          // Keep the last few chars in case the '[' is split across chunks.
+          buffer = buffer.slice(Math.max(0, buffer.length - 1));
+          continue;
+        }
+
+        buffer = buffer.slice(startIndex);
+        arrayStarted = true;
+      }
+
+      for (let idx = 0; idx < buffer.length; idx += 1) {
+        const char = buffer[idx] as string;
+
+        if (inString) {
+          if (escaped) {
+            escaped = false;
+            continue;
+          }
+          if (char === '\\') {
+            escaped = true;
+            continue;
+          }
+          if (char === '"') {
+            inString = false;
+          }
+          continue;
+        }
+
+        if (char === '"') {
+          inString = true;
+          continue;
+        }
+
+        if (char === '[' && !arrayStarted) {
+          arrayStarted = true;
+          continue;
+        }
+
+        if (!arrayStarted) {
+          continue;
+        }
+
+        if (char === '{') {
+          if (braceDepth === 0) {
+            objectStart = idx;
+          }
+          braceDepth += 1;
+          continue;
+        }
+
+        if (char === '}') {
+          if (braceDepth > 0) {
+            braceDepth -= 1;
+            if (braceDepth === 0 && objectStart !== -1) {
+              const raw = buffer.slice(objectStart, idx + 1);
+              yield JSON.parse(raw) as Document;
+              buffer = buffer.slice(idx + 1);
+              idx = -1;
+              objectStart = -1;
+            }
+          }
+          continue;
+        }
+
+        if (char === ']' && braceDepth === 0) {
+          return;
+        }
+      }
+    }
+  } catch (error) {
+    if (isEnoentError(error)) {
+      return;
+    }
+    throw error;
+  }
+}
+
 async function readSnapshot(filePath: string): Promise<Document[]> {
   try {
     const raw = await fsp.readFile(filePath, 'utf8');
@@ -2277,6 +2452,37 @@ async function readFileFromPosition(filePath: string, offset: number): Promise<s
       resolve(data);
     });
   });
+}
+
+async function* streamLogEntries(
+  filePath: string,
+  offset = 0
+): AsyncGenerator<LogEntry> {
+  try {
+    let buffer = '';
+    const stream = fs.createReadStream(filePath, { encoding: 'utf8', start: offset });
+    for await (const chunk of stream) {
+      buffer += chunk;
+      let newlineIndex = buffer.indexOf('\n');
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(newlineIndex + 1);
+        if (line.trim()) {
+          yield JSON.parse(line) as LogEntry;
+        }
+        newlineIndex = buffer.indexOf('\n');
+      }
+    }
+
+    if (buffer.trim()) {
+      yield JSON.parse(buffer) as LogEntry;
+    }
+  } catch (error) {
+    if (isEnoentError(error)) {
+      return;
+    }
+    throw error;
+  }
 }
 
 async function getFileSize(filePath: string): Promise<number> {

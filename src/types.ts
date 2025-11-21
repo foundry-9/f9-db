@@ -89,6 +89,11 @@ export interface FindOptions {
   skip?: number;
   sort?: Record<string, 1 | -1>;
   stream?: boolean;
+  /**
+   * When true, `stream` reads directly from snapshot/log files instead of loading the in-memory collection map.
+   * This is best for very large datasets where memory pressure is a concern.
+   */
+  streamFromFiles?: boolean;
   diagnostics?: (stats: StreamDiagnostics) => void;
 }
 

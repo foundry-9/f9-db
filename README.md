@@ -48,6 +48,7 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 - Compaction folds logs into snapshots, drops tombstones/stale versions, refreshes indexes, and records checkpoints in manifest.
 - Indexed queries intersect posting lists; fall back to streaming scan when no index applies.
 - Sorting in-memory for small result sets; bounded heap for streaming with limits.
+- Streaming can pull directly from snapshot/log files (`streamFromFiles: true`) to avoid materializing the in-memory collection map for very large datasets.
 
 ## Logging & Observability
 
