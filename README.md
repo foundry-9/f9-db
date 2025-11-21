@@ -29,7 +29,7 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 
 - `createDatabase(opts)` → db
   - Options: `dataDir`, `binaryDir`, `log` (custom logger), `autoCompact`, `fsync` mode, tokenizer/index config, limits.
-- CRUD: `insert(collection, doc)`, `get(collection, id)`, `update(collection, id, mutation)`, `updateWhere(collection, mutation | (doc) => mutation, filter, opts?)`, `remove(collection, id)`.
+- CRUD: `insert(collection, doc)`, `get(collection, id)`, `update(collection, id, mutation)`, `updateWhere(collection, mutation | (doc) => mutation, filter, opts?)`, `removeWhere(collection, filter?, opts?)`, `remove(collection, id)`.
 - Query: `find(collection, filter, opts)` (JSON result), `stream(collection, filter, opts)` (AsyncIterator yielding JSONL).
   - Filters support SQL-style predicates: direct equality, `$gt/$gte/$lt/$lte`, `$between`, `$in/$nin`, `$like/$ilike`, `$isNull/$exists`, and boolean `$and/$or/$not`. Arrays remain shorthand for `IN`.
   - Projections: `projection: ['name', 'profile.city']` trims fields before returning/streaming (always includes `_id`).
@@ -37,6 +37,7 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
 - Index mgmt: `ensureIndex(collection, field, options)`, `rebuildIndex`.
 - Relations: `join(collection, doc, relations)` resolves foreign refs into nested objects/arrays with batching to avoid N+1. Cache size/TTL are configurable; call `clearJoinCache()` to flush manually.
 - Updates accept partial objects or a mutation function; use `updateWhere` to apply a mutation across matching docs with optional `sort/limit/skip` (e.g., bump the lowest scoring user in London).
+- `removeWhere` mirrors SQL `DELETE ... WHERE ...`, letting you remove a filtered slice of rows with optional `sort`, `limit`, and `skip`, returning the deleted docs.
 
 Example aggregations:
 

@@ -19,6 +19,7 @@ const db = createDatabase({ dataDir: './data', binaryDir: './binaries' });
 - `GROUP BY` / aggregates → `groupBy` + `aggregates` on `find`
 - `ROW_NUMBER() OVER (PARTITION BY ...)` → `partitionBy` + `rowNumber` on `find`
 - `JOIN` → fetch docs, then `db.join(collection, doc, relations)` to resolve foreign keys into nested objects/arrays
+- `DELETE FROM ... WHERE ...` → `db.removeWhere('table', filter?, { sort?, limit?, skip? })` (returns deleted docs)
 - `CREATE INDEX` → `db.ensureIndex(collection, field, { unique?: true })`
 - `UPDATE ... SET ... WHERE ...` → `db.updateWhere('table', mutation|((doc) => mutation), filter, { sort?, limit?, skip? })` (use `update(id, patch)` when you already have the `_id`)
 
@@ -129,6 +130,43 @@ const [bumped] = await db.updateWhere(
   { sort: { score: 1 }, limit: 1 }
 );
 // bumped contains the updated doc with the lowest previous score in London
+```
+
+## DELETE Equivalents
+
+Use `removeWhere` to mirror SQL’s `DELETE FROM ... WHERE ...` semantics. It deletes matching documents, respects optional `sort`, `limit`, and `skip`, and returns the removed rows for auditing or cleanup logic.
+
+**Basic DELETE**
+
+SQL
+
+```sql
+DELETE FROM orders WHERE status = 'pending';
+```
+
+f9-db
+
+```ts
+await db.removeWhere('orders', { status: 'pending' });
+```
+
+**DELETE with ORDER BY/LIMIT**
+
+SQL
+
+```sql
+DELETE FROM users WHERE city = 'London' ORDER BY score ASC LIMIT 1;
+```
+
+f9-db
+
+```ts
+const [deleted] = await db.removeWhere(
+  'users',
+  { city: 'London' },
+  { sort: { score: 1 }, limit: 1 }
+);
+// deleted contains the single doc that was removed
 ```
 
 ## Aggregations and Windows

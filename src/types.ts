@@ -184,6 +184,7 @@ export interface FindOptions {
 export type UpdateMutation = Partial<Document> | ((doc: Document) => Partial<Document>);
 
 export type UpdateWhereOptions = Pick<FindOptions, 'limit' | 'skip' | 'sort'>;
+export type RemoveWhereOptions = Pick<FindOptions, 'limit' | 'skip' | 'sort'>;
 
 export type AggregateOperator = 'count' | 'sum' | 'avg' | 'min' | 'max';
 
@@ -323,6 +324,11 @@ export interface Database {
     mutation: UpdateMutation,
     filter: Filter,
     options?: UpdateWhereOptions
+  ) => Promise<Document[]>;
+  removeWhere: (
+    collection: string,
+    filter?: Filter,
+    options?: RemoveWhereOptions
   ) => Promise<Document[]>;
   remove: (collection: string, id: DocumentId) => Promise<void>;
   find: (

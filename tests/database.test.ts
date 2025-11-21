@@ -98,7 +98,44 @@ describe('JsonFileDatabase', () => {
         { name: 'Ada', score: 10, touched: undefined },
         { name: 'Bob', score: 6, touched: true },
         { name: 'Carol', score: 1, touched: undefined }
-      ]);
+    ]);
+  });
+
+  test('removeWhere removes matching docs and returns them', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    await db.insert('orders', { status: 'pending', total: 15 });
+    await db.insert('orders', { status: 'pending', total: 25 });
+    await db.insert('orders', { status: 'done', total: 5 });
+
+    const deleted = await db.removeWhere('orders', { status: 'pending' });
+    expect(deleted).toHaveLength(2);
+    expect(deleted.every((order) => order.status === 'pending')).toBe(true);
+
+    const remaining = await db.find('orders');
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]?.status).toBe('done');
+  });
+
+  test('removeWhere respects sort/limit like SQL DELETE', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    await db.insert('users', { name: 'Ada', city: 'London', score: 10 });
+    await db.insert('users', { name: 'Bob', city: 'London', score: 5 });
+    await db.insert('users', { name: 'Carol', city: 'Lisbon', score: 1 });
+
+    const deleted = await db.removeWhere(
+      'users',
+      { city: 'London' },
+      { sort: { score: 1 }, limit: 1 }
+    );
+
+    expect(deleted.map((user) => user.name)).toEqual(['Bob']);
+
+    const remaining = await db.find('users', {}, { sort: { name: 1 } });
+    expect(remaining.map((user) => user.name)).toEqual(['Ada', 'Carol']);
   });
 
   test('remove deletes a document', async () => {

@@ -27,6 +27,7 @@ import type {
   ComparableValue,
   CustomTypeRegistry,
   CustomTypeDefinition,
+  RemoveWhereOptions,
   UpdateWhereOptions,
   UpdateMutation
 } from './types.js';
@@ -319,6 +320,70 @@ class JsonFileDatabase implements Database {
       }
 
       return updated;
+    });
+  }
+
+  async removeWhere(
+    collection: string,
+    filter: Filter = {},
+    options: RemoveWhereOptions = {}
+  ): Promise<Document[]> {
+    return this.withCollectionLock(collection, async () => {
+      const state = await this.loadCollection(collection);
+      const schema = await this.getCollectionSchema(collection);
+      const { limit = Infinity, skip = 0, sort } = options;
+      const sortKeys = sort ? Object.keys(sort) : [];
+      const candidates = await this.getIndexedCandidates(collection, filter, state);
+      const docsToScan = candidates
+        ? Array.from(candidates)
+            .map((id) => state.docs.get(id))
+            .filter(Boolean) as Document[]
+        : Array.from(state.docs.values());
+
+      let matches = docsToScan.filter((doc) =>
+        matchesFilter(doc, filter, schema, this.options.customTypes)
+      );
+
+      if (sortKeys.length > 0) {
+        matches = matches.sort((left, right) =>
+          compareDocuments(
+            left,
+            right,
+            sort as Record<string, 1 | -1>,
+            schema,
+            this.options.customTypes
+          )
+        );
+      }
+
+      const start = skip;
+      const end = Number.isFinite(limit) ? start + limit : matches.length;
+      const selection = matches.slice(start, Math.min(end, matches.length));
+      const deleted: Document[] = [];
+
+      for (const doc of selection) {
+        const targetId = doc._id as DocumentId | undefined;
+        if (!targetId) {
+          continue;
+        }
+
+        const existing = state.docs.get(targetId);
+        if (!existing) {
+          continue;
+        }
+
+        state.docs.delete(targetId);
+        await this.appendLog(collection, state, { _id: targetId, tombstone: true });
+        await this.refreshIndexesForWrite(collection, state, null, existing);
+        await this.applyBinaryRefChanges(null, existing);
+        deleted.push(cloneDocument(existing));
+      }
+
+      if (deleted.length > 0) {
+        this.resetJoinCache();
+      }
+
+      return deleted;
     });
   }
 
