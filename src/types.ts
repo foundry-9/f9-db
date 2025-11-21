@@ -150,18 +150,12 @@ export interface FieldOperator {
 
 export type FieldPredicate = ComparableValue | ComparableValue[] | FieldOperator;
 
-export interface LogicalFilter {
+export interface Filter {
+  [field: string]: FieldPredicate | Filter | Filter[] | undefined;
   $and?: Filter[];
   $or?: Filter[];
   $not?: Filter;
 }
-
-export type Filter = LogicalFilter &
-  Record<
-    string,
-    | FieldPredicate
-    | undefined
-  >;
 
 export interface FindOptions {
   limit?: number;
