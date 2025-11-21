@@ -86,6 +86,21 @@ describe('JsonFileDatabase', () => {
     expect(sorted.map((u) => u.name)).toEqual(['Ada', 'Bob']);
   });
 
+  test('find applies projection to trim returned fields', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    const saved = await db.insert('users', {
+      name: 'Ada',
+      age: 32,
+      profile: { city: 'London', title: 'Countess' }
+    });
+
+    const [projected] = await db.find('users', {}, { projection: ['name', 'profile.city'] });
+    expect(projected).toEqual({ _id: saved._id, name: 'Ada', profile: { city: 'London' } });
+    expect(projected?.age).toBeUndefined();
+  });
+
   test('find evaluates SQL-like predicates (comparisons, boolean logic, NULL)', async () => {
     ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
@@ -135,6 +150,25 @@ describe('JsonFileDatabase', () => {
     }
 
     expect(seen).toEqual(['Ada']);
+  });
+
+  test('stream applies projection before yielding JSONL', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    await db.insert('users', { name: 'Ada', age: 32 });
+    await db.insert('users', { name: 'Bob', age: 40 });
+
+    const names: string[] = [];
+    for await (const line of db.stream('users', {}, { projection: ['name'] })) {
+      const parsed = JSON.parse(line);
+      expect(parsed).toHaveProperty('_id');
+      expect(parsed).toHaveProperty('name');
+      expect(parsed).not.toHaveProperty('age');
+      names.push(parsed.name as string);
+    }
+
+    expect(names.sort()).toEqual(['Ada', 'Bob']);
   });
 
   test('stream sorts with bounded buffer and emits JSONL', async () => {

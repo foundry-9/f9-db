@@ -276,7 +276,7 @@ class JsonFileDatabase implements Database {
     options: FindOptions = {}
   ): Promise<Document[]> {
     const state = await this.loadCollection(collection);
-    const { limit = Infinity, skip = 0, sort } = options;
+    const { limit = Infinity, skip = 0, sort, projection } = options;
     const sortKeys = sort ? Object.keys(sort) : [];
 
     const candidates = await this.getIndexedCandidates(collection, filter, state);
@@ -294,7 +294,9 @@ class JsonFileDatabase implements Database {
       );
     }
 
-    return results.slice(skip, skip + limit).map(cloneDocument);
+    return results
+      .slice(skip, skip + limit)
+      .map((doc) => projectDocument(doc, projection));
   }
 
   async *stream(
@@ -302,7 +304,14 @@ class JsonFileDatabase implements Database {
     filter: Filter = {},
     options: FindOptions = {}
   ): AsyncIterable<string> {
-    const { limit = Infinity, skip = 0, sort, diagnostics, streamFromFiles } = options;
+    const {
+      limit = Infinity,
+      skip = 0,
+      sort,
+      projection,
+      diagnostics,
+      streamFromFiles
+    } = options;
     const sortKeys = sort ? Object.keys(sort) : [];
     const stats = {
       scannedDocs: 0,
@@ -340,7 +349,7 @@ class JsonFileDatabase implements Database {
           if (yielded >= limit) {
             break;
           }
-          yield `${JSON.stringify(cloneDocument(doc))}\n`;
+          yield `${JSON.stringify(projectDocument(doc, projection))}\n`;
           yielded += 1;
           stats.yieldedDocs = yielded;
         }
@@ -366,7 +375,7 @@ class JsonFileDatabase implements Database {
         const finalBuffer = buffer.slice(start, Math.min(end, buffer.length));
         stats.yieldedDocs = finalBuffer.length;
         for (const doc of finalBuffer) {
-          yield `${JSON.stringify(cloneDocument(doc))}\n`;
+          yield `${JSON.stringify(projectDocument(doc, projection))}\n`;
         }
       }
     } finally {

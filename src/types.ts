@@ -118,6 +118,7 @@ export interface FindOptions {
   limit?: number;
   skip?: number;
   sort?: Record<string, 1 | -1>;
+  projection?: string[];
   stream?: boolean;
   /**
    * When true, `stream` reads directly from snapshot/log files instead of loading the in-memory collection map.
