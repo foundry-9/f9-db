@@ -1,20 +1,24 @@
 import fs from 'node:fs';
+import { promises as fsp } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { afterEach, describe, expect, jest, test } from '@jest/globals';
 import { createDatabase } from '../src/index.js';
 import type { Database } from '../src/types.js';
 
-function createTempDirs(): { dataDir: string; binaryDir: string } {
+function createTempDirs(): { dataDir: string; binaryDir: string; logDir: string } {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'f9-db-data-'));
   const binaryDir = path.join(dataDir, 'binaries');
+  const logDir = path.join(dataDir, 'logs');
   fs.mkdirSync(binaryDir, { recursive: true });
-  return { dataDir, binaryDir };
+  fs.mkdirSync(logDir, { recursive: true });
+  return { dataDir, binaryDir, logDir };
 }
 
 describe('JsonFileDatabase', () => {
   let dataDir: string;
   let binaryDir: string;
+  let logDir: string;
   let db: Database;
 
   afterEach(() => {
@@ -24,7 +28,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('insert and get round trip', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
 
     const saved = await db.insert('users', { name: 'Ada' });
@@ -35,7 +39,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('update overwrites fields while keeping id', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
 
     const saved = await db.insert('users', { name: 'Bob', age: 40 });
@@ -53,7 +57,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('remove deletes a document', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
 
     const saved = await db.insert('users', { name: 'Carol' });
@@ -63,7 +67,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('find supports filters, sorting, skip, and limit', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
 
     await db.insert('users', { name: 'Ada', age: 32 });
@@ -83,7 +87,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('stream yields matching documents respecting limit/skip', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
 
     await db.insert('users', { name: 'Ada', age: 32 });
@@ -103,7 +107,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('auto snapshots after the configured write interval', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({
       dataDir,
       binaryDir,
@@ -133,7 +137,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('startup replays log entries only after the manifest checkpoint', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     const manifestPath = path.join(dataDir, 'manifest.json');
     const snapshotPath = path.join(dataDir, 'users.snapshot.json');
     const logPath = path.join(dataDir, 'users.jsonl');
@@ -178,7 +182,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('truncates log after snapshot by default to reclaim disk', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({
       dataDir,
       binaryDir,
@@ -203,7 +207,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('rotates log after snapshot when logRetention is rotate', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({
       dataDir,
       binaryDir,
@@ -235,7 +239,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('ensureIndex builds index file and records checkpoint/stats', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir, autoCompact: false });
 
     const ada = await db.insert('users', { name: 'Ada Lovelace' });
@@ -261,7 +265,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('rebuildIndex refreshes entries and bumps version/checkpoint', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir, autoCompact: false });
 
     await db.insert('users', { name: 'Ada' });
@@ -289,7 +293,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('find emits log when an index is used to satisfy a filter', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     const debug = jest.fn();
     db = createDatabase({ dataDir, binaryDir, log: { debug } });
 
@@ -312,7 +316,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('unique indexes are enforced on insert, update, and remove', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
 
     await db.ensureIndex('users', 'name', { unique: true });
@@ -341,7 +345,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('schema validation enforces types, required fields, and defaults', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({
       dataDir,
       binaryDir,
@@ -400,7 +404,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('join resolves relations with batching and projection', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
 
     const author = await db.insert('users', { name: 'Ada', role: 'author' });
@@ -439,7 +443,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('join returns null/empty when relations are missing', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
 
     const post = await db.insert('posts', { title: 'Lonely' });
@@ -453,7 +457,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('join cache clears after writes so subsequent joins see updates', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
 
     const user = await db.insert('users', { name: 'Ada' });
@@ -473,7 +477,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('join projections support nested fields', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
 
     const user = await db.insert('users', {
@@ -497,7 +501,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('join cache obeys max entries and evicts oldest', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir, joinCacheMaxEntries: 1 });
 
     const alice = await db.insert('users', { name: 'Alice' });
@@ -528,7 +532,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('join cache TTL refreshes entries after expiry', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir, joinCacheTTLms: 5 });
 
     const alice = await db.insert('users', { name: 'Alice' });
@@ -559,7 +563,7 @@ describe('JsonFileDatabase', () => {
   });
 
   test('clearJoinCache manually flushes cached relations', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });
 
     const alice = await db.insert('users', { name: 'Alice' });
@@ -586,8 +590,8 @@ describe('JsonFileDatabase', () => {
   });
 
   test('binary store writes hashed files, dedupes, and reads content', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
-    db = createDatabase({ dataDir, binaryDir });
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir, logDir });
 
     const saved = await db.saveBinary('hello', { mimeType: 'text/plain' });
     const filePath = path.join(binaryDir, saved.sha256);
@@ -612,8 +616,8 @@ describe('JsonFileDatabase', () => {
   });
 
   test('binary refs on documents update manifest counts and gate deletion', async () => {
-    ({ dataDir, binaryDir } = createTempDirs());
-    db = createDatabase({ dataDir, binaryDir });
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir, logDir });
 
     const binary = await db.saveBinary(Buffer.from('payload'), { mimeType: 'application/octet-stream' });
     const doc = await db.insert('files', {
@@ -636,5 +640,110 @@ describe('JsonFileDatabase', () => {
     const removed = await db.deleteBinary(binary.sha256);
     expect(removed).toBe(true);
     expect(fs.existsSync(path.join(binaryDir, binary.sha256))).toBe(false);
+  });
+
+  test('binary store can disable dedupe and remove missing hashes cleanly', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir, logDir });
+
+    const first = await db.saveBinary('hello');
+    const filePath = path.join(binaryDir, first.sha256);
+    const firstStat = fs.statSync(filePath);
+
+    const second = await db.saveBinary('hello', { dedupe: false });
+    const secondStat = fs.statSync(filePath);
+
+    expect(second.sha256).toBe(first.sha256);
+    expect(second.deduped).toBe(false);
+    expect(secondStat.mtimeMs).toBeGreaterThanOrEqual(firstStat.mtimeMs);
+
+    const missingRead = await db.readBinary('missing');
+    expect(missingRead).toBeNull();
+
+    const deleted = await db.deleteBinary('missing');
+    expect(deleted).toBe(false);
+  });
+
+  test('default file logger writes JSON lines to logDir', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir, logDir });
+
+    await db.insert('users', { name: 'Ada' });
+    await db.ensureIndex('users', 'name');
+    await db.find('users', { name: 'Ada' });
+
+    const logPath = path.join(logDir, 'app.log');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n');
+    expect(lines.length).toBeGreaterThan(0);
+
+    const firstEntry = JSON.parse(lines[0] as string);
+    expect(firstEntry.level).toBeDefined();
+    expect(firstEntry.time).toBeDefined();
+    expect(firstEntry.msg).toBeDefined();
+  });
+
+  test('fsync option toggles sync calls for writes', async () => {
+    let syncSpy: jest.SpiedFunction<() => Promise<void>> | undefined;
+    try {
+      const firstDirs = createTempDirs();
+      ({ dataDir, binaryDir, logDir } = firstDirs);
+      const probe = await fsp.open(path.join(dataDir, 'probe.tmp'), 'w');
+      const fileHandleProto = Object.getPrototypeOf(probe) as {
+        sync: () => Promise<void>;
+      };
+      syncSpy = jest.spyOn(fileHandleProto, 'sync');
+      await probe.close();
+
+      db = createDatabase({
+        dataDir,
+        binaryDir,
+        logDir,
+        fsync: 'always',
+        autoCompact: false
+      });
+
+      await db.insert('users', { name: 'Ada' });
+      expect(syncSpy).toHaveBeenCalled();
+      fs.rmSync(firstDirs.dataDir, { recursive: true, force: true });
+
+      syncSpy.mockClear();
+
+      const secondDirs = createTempDirs();
+      ({ dataDir, binaryDir, logDir } = secondDirs);
+      db = createDatabase({
+        dataDir,
+        binaryDir,
+        logDir,
+        fsync: 'never',
+        autoCompact: false
+      });
+
+      await db.insert('users', { name: 'Bob' });
+      expect(syncSpy).not.toHaveBeenCalled();
+    } finally {
+      syncSpy?.mockRestore();
+    }
+  });
+
+  test('lockfile mode waits for locks and times out when held', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    const lockPath = path.join(dataDir, 'users.lock');
+    fs.writeFileSync(lockPath, 'held');
+
+    db = createDatabase({
+      dataDir,
+      binaryDir,
+      logDir,
+      lockMode: 'lockfile',
+      lockRetryMs: 5,
+      lockTimeoutMs: 25
+    });
+
+    await expect(db.insert('users', { name: 'Blocked' })).rejects.toThrow(/Timed out acquiring lock/);
+
+    fs.rmSync(lockPath, { force: true });
+    const inserted = await db.insert('users', { name: 'Allowed' });
+    expect(inserted.name).toBe('Allowed');
   });
 });

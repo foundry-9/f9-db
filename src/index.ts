@@ -28,8 +28,13 @@ import type {
 interface ResolvedOptions extends DatabaseOptions {
   dataDir: string;
   binaryDir: string;
+  logDir: string;
   log: Logger;
   logRetention: 'truncate' | 'rotate' | 'keep';
+  fsync: 'always' | 'batch' | 'never';
+  lockMode: 'lockfile' | 'flock' | 'none';
+  lockRetryMs: number;
+  lockTimeoutMs: number;
   indexDir: string;
   tokenizer: TokenizerOptions;
   schemas: Record<string, CollectionSchema>;
@@ -80,12 +85,96 @@ interface JoinCacheEntry {
   expiresAt: number;
 }
 
-const noopLogger: Logger = {
-  debug: () => undefined,
-  info: () => undefined,
-  warn: () => undefined,
-  error: () => undefined
-};
+interface LockConfig {
+  path: string;
+  retryMs: number;
+  timeoutMs: number;
+}
+
+class FileLock {
+  private handle: fs.promises.FileHandle | null = null;
+  private readonly path: string;
+  private readonly retryMs: number;
+  private readonly timeoutMs: number;
+
+  constructor(config: LockConfig) {
+    this.path = config.path;
+    this.retryMs = config.retryMs;
+    this.timeoutMs = config.timeoutMs;
+  }
+
+  async acquire(): Promise<void> {
+    const start = Date.now();
+
+    // Cheap retry/backoff loop that prefers fast acquisition.
+    while (true) {
+      try {
+        this.handle = await fsp.open(this.path, 'wx');
+        return;
+      } catch (error) {
+        if (!isEexistError(error)) {
+          throw error;
+        }
+      }
+
+      if (Date.now() - start >= this.timeoutMs) {
+        throw new Error(`Timed out acquiring lock at ${this.path}`);
+      }
+
+      await delay(this.retryMs);
+    }
+  }
+
+  async release(): Promise<void> {
+    const handle = this.handle;
+    this.handle = null;
+
+    if (handle) {
+      try {
+        await handle.close();
+      } catch (error) {
+        if (!isEnoentError(error)) {
+          throw error;
+        }
+      }
+    }
+
+    try {
+      await fsp.unlink(this.path);
+    } catch (error) {
+      if (error && !isEnoentError(error)) {
+        throw error;
+      }
+    }
+  }
+}
+
+function createFileLogger(logDir: string): Logger {
+  const logPath = path.join(logDir, 'app.log');
+  fs.mkdirSync(path.dirname(logPath), { recursive: true });
+  const stream = fs.createWriteStream(logPath, { flags: 'a' });
+
+  const write = (level: string, msg: string, context?: Record<string, unknown>): void => {
+    const payload: Record<string, unknown> = {
+      level,
+      time: new Date().toISOString(),
+      msg
+    };
+
+    if (context && Object.keys(context).length > 0) {
+      payload.context = context;
+    }
+
+    stream.write(`${JSON.stringify(payload)}\n`);
+  };
+
+  return {
+    debug: (msg, context) => write('debug', msg, context),
+    info: (msg, context) => write('info', msg, context),
+    warn: (msg, context) => write('warn', msg, context),
+    error: (msg, context) => write('error', msg, context)
+  };
+}
 
 class JsonFileDatabase implements Database {
   private options: ResolvedOptions;
@@ -96,6 +185,7 @@ class JsonFileDatabase implements Database {
     string,
     Map<string, Map<string, JoinCacheEntry>>
   >();
+  private flockWarningEmitted = false;
 
   constructor(options: DatabaseOptions = {}) {
     this.options = resolveOptions(options);
@@ -104,26 +194,28 @@ class JsonFileDatabase implements Database {
   }
 
   async insert(collection: string, doc: Document): Promise<Document> {
-    const state = await this.loadCollection(collection);
-    const _id = (doc._id as DocumentId | undefined) ?? crypto.randomUUID();
+    return this.withCollectionLock(collection, async () => {
+      const state = await this.loadCollection(collection);
+      const _id = (doc._id as DocumentId | undefined) ?? crypto.randomUUID();
 
-    if (state.docs.has(_id)) {
-      throw new Error(`Duplicate _id '${_id}' in collection '${collection}'`);
-    }
+      if (state.docs.has(_id)) {
+        throw new Error(`Duplicate _id '${_id}' in collection '${collection}'`);
+      }
 
-    const stored: Document = { ...doc, _id };
-    const normalized = await this.normalizeAndValidateDocument(
-      collection,
-      stored,
-      true
-    );
-    await this.enforceUniqueConstraints(collection, normalized, state, null);
-    state.docs.set(_id, normalized);
-    await this.appendLog(collection, state, { _id, data: normalized });
-    await this.refreshIndexesForWrite(collection, state, normalized, null);
-    await this.applyBinaryRefChanges(normalized, null);
-    this.resetJoinCache();
-    return cloneDocument(normalized);
+      const stored: Document = { ...doc, _id };
+      const normalized = await this.normalizeAndValidateDocument(
+        collection,
+        stored,
+        true
+      );
+      await this.enforceUniqueConstraints(collection, normalized, state, null);
+      state.docs.set(_id, normalized);
+      await this.appendLog(collection, state, { _id, data: normalized });
+      await this.refreshIndexesForWrite(collection, state, normalized, null);
+      await this.applyBinaryRefChanges(normalized, null);
+      this.resetJoinCache();
+      return cloneDocument(normalized);
+    });
   }
 
   async get(collection: string, id: DocumentId): Promise<Document | null> {
@@ -137,41 +229,45 @@ class JsonFileDatabase implements Database {
     id: DocumentId,
     mutation: Partial<Document>
   ): Promise<Document> {
-    const state = await this.loadCollection(collection);
-    const existing = state.docs.get(id);
+    return this.withCollectionLock(collection, async () => {
+      const state = await this.loadCollection(collection);
+      const existing = state.docs.get(id);
 
-    if (!existing) {
-      throw new Error(`Document '${id}' not found in collection '${collection}'`);
-    }
+      if (!existing) {
+        throw new Error(`Document '${id}' not found in collection '${collection}'`);
+      }
 
-    const updated: Document = { ...existing, ...mutation, _id: id };
-    const normalized = await this.normalizeAndValidateDocument(
-      collection,
-      updated,
-      false
-    );
-    await this.enforceUniqueConstraints(collection, normalized, state, id);
-    state.docs.set(id, normalized);
-    await this.appendLog(collection, state, { _id: id, data: normalized });
-    await this.refreshIndexesForWrite(collection, state, normalized, existing);
-    await this.applyBinaryRefChanges(normalized, existing);
-    this.resetJoinCache();
-    return cloneDocument(normalized);
+      const updated: Document = { ...existing, ...mutation, _id: id };
+      const normalized = await this.normalizeAndValidateDocument(
+        collection,
+        updated,
+        false
+      );
+      await this.enforceUniqueConstraints(collection, normalized, state, id);
+      state.docs.set(id, normalized);
+      await this.appendLog(collection, state, { _id: id, data: normalized });
+      await this.refreshIndexesForWrite(collection, state, normalized, existing);
+      await this.applyBinaryRefChanges(normalized, existing);
+      this.resetJoinCache();
+      return cloneDocument(normalized);
+    });
   }
 
   async remove(collection: string, id: DocumentId): Promise<void> {
-    const state = await this.loadCollection(collection);
+    await this.withCollectionLock(collection, async () => {
+      const state = await this.loadCollection(collection);
 
-    if (!state.docs.has(id)) {
-      throw new Error(`Document '${id}' not found in collection '${collection}'`);
-    }
+      if (!state.docs.has(id)) {
+        throw new Error(`Document '${id}' not found in collection '${collection}'`);
+      }
 
-    const existing = state.docs.get(id) ?? null;
-    state.docs.delete(id);
-    await this.appendLog(collection, state, { _id: id, tombstone: true });
-    await this.refreshIndexesForWrite(collection, state, null, existing);
-    await this.applyBinaryRefChanges(null, existing);
-    this.resetJoinCache();
+      const existing = state.docs.get(id) ?? null;
+      state.docs.delete(id);
+      await this.appendLog(collection, state, { _id: id, tombstone: true });
+      await this.refreshIndexesForWrite(collection, state, null, existing);
+      await this.applyBinaryRefChanges(null, existing);
+      this.resetJoinCache();
+    });
   }
 
   async find(
@@ -239,77 +335,106 @@ class JsonFileDatabase implements Database {
     field: string,
     options: IndexOptions = {}
   ): Promise<void> {
-    const state = await this.loadCollection(collection);
-    const normalized = normalizeIndexOptions(options, this.options.tokenizer);
-    const indexPath = this.getIndexPath(collection, field);
+    await this.withCollectionLock(collection, async () => {
+      const state = await this.loadCollection(collection);
+      const normalized = normalizeIndexOptions(options, this.options.tokenizer);
+      const indexPath = this.getIndexPath(collection, field);
 
-    const manifest = await this.getManifest();
-    const collectionEntry = manifest.collections[collection];
-    const existing = collectionEntry?.indexes?.[field];
-    const now = new Date().toISOString();
-    const optionsChanged = existing
-      ? !indexOptionsEqual(existing.options, normalized)
-      : true;
+      const manifest = await this.getManifest();
+      const collectionEntry = manifest.collections[collection];
+      const existing = collectionEntry?.indexes?.[field];
+      const now = new Date().toISOString();
+      const optionsChanged = existing
+        ? !indexOptionsEqual(existing.options, normalized)
+        : true;
 
-    const metadata: IndexMetadata = {
-      field,
-      path: indexPath,
-      options: normalized,
-      version: optionsChanged
-        ? (existing?.version ?? 0) + 1
-        : existing?.version ?? 1,
-      state: optionsChanged ? 'pending' : existing?.state ?? 'pending',
-      checkpoint: optionsChanged ? 0 : existing?.checkpoint ?? 0,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now,
-      stats: optionsChanged ? undefined : existing?.stats,
-      lastError: optionsChanged ? undefined : existing?.lastError
-    };
+      const metadata: IndexMetadata = {
+        field,
+        path: indexPath,
+        options: normalized,
+        version: optionsChanged
+          ? (existing?.version ?? 0) + 1
+          : existing?.version ?? 1,
+        state: optionsChanged ? 'pending' : existing?.state ?? 'pending',
+        checkpoint: optionsChanged ? 0 : existing?.checkpoint ?? 0,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        stats: optionsChanged ? undefined : existing?.stats,
+        lastError: optionsChanged ? undefined : existing?.lastError
+      };
 
-    await this.updateManifest(collection, {
-      indexes: { [field]: metadata }
-    });
+      await this.updateManifest(collection, {
+        indexes: { [field]: metadata }
+      });
 
-    await writeIndexStub(indexPath, metadata);
-    await this.buildIndex(collection, field, metadata, state);
-    this.options.log?.info?.('Index metadata recorded', {
-      collection,
-      field,
-      state: metadata.state,
-      version: metadata.version
+      await writeIndexStub(indexPath, metadata, this.options.fsync);
+      await this.buildIndex(collection, field, metadata, state);
+      this.options.log?.info?.('Index metadata recorded', {
+        collection,
+        field,
+        state: metadata.state,
+        version: metadata.version
+      });
     });
   }
 
   async rebuildIndex(collection: string, field: string): Promise<void> {
-    const state = await this.loadCollection(collection);
-    const manifest = await this.getManifest();
-    const existing = manifest.collections[collection]?.indexes?.[field];
+    await this.withCollectionLock(collection, async () => {
+      const state = await this.loadCollection(collection);
+      const manifest = await this.getManifest();
+      const existing = manifest.collections[collection]?.indexes?.[field];
 
-    if (!existing) {
-      await this.ensureIndex(collection, field);
-      return;
-    }
+      if (!existing) {
+        const normalized = normalizeIndexOptions({}, this.options.tokenizer);
+        const indexPath = this.getIndexPath(collection, field);
+        const now = new Date().toISOString();
+        const metadata: IndexMetadata = {
+          field,
+          path: indexPath,
+          options: normalized,
+          version: 1,
+          state: 'pending',
+          checkpoint: 0,
+          createdAt: now,
+          updatedAt: now
+        };
 
-    const metadata: IndexMetadata = {
-      ...existing,
-      state: 'pending',
-      checkpoint: 0,
-      stats: undefined,
-      lastError: undefined,
-      version: existing.version + 1,
-      updatedAt: new Date().toISOString()
-    };
+        await this.updateManifest(collection, {
+          indexes: { [field]: metadata }
+        });
 
-    await this.updateManifest(collection, {
-      indexes: { [field]: metadata }
-    });
+        await writeIndexStub(indexPath, metadata, this.options.fsync);
+        await this.buildIndex(collection, field, metadata, state);
+        this.options.log?.info?.('Index metadata recorded', {
+          collection,
+          field,
+          state: metadata.state,
+          version: metadata.version
+        });
+        return;
+      }
 
-    await writeIndexStub(this.getIndexPath(collection, field), metadata);
-    await this.buildIndex(collection, field, metadata, state);
-    this.options.log?.info?.('Index rebuild scheduled', {
-      collection,
-      field,
-      version: metadata.version
+      const metadata: IndexMetadata = {
+        ...existing,
+        state: 'pending',
+        checkpoint: 0,
+        stats: undefined,
+        lastError: undefined,
+        version: existing.version + 1,
+        updatedAt: new Date().toISOString()
+      };
+
+      await this.updateManifest(collection, {
+        indexes: { [field]: metadata }
+      });
+
+      await writeIndexStub(this.getIndexPath(collection, field), metadata, this.options.fsync);
+      await this.buildIndex(collection, field, metadata, state);
+      this.options.log?.info?.('Index rebuild scheduled', {
+        collection,
+        field,
+        version: metadata.version
+      });
     });
   }
 
@@ -370,12 +495,47 @@ class JsonFileDatabase implements Database {
   }
 
   async compact(collection: string): Promise<void> {
-    const state = await this.loadCollection(collection);
-    await this.compactCollection(collection, state);
+    await this.withCollectionLock(collection, async () => {
+      const state = await this.loadCollection(collection);
+      await this.compactCollection(collection, state);
+    });
   }
 
   clearJoinCache(): void {
     this.resetJoinCache();
+  }
+
+  private async withCollectionLock<T>(
+    collection: string,
+    action: () => Promise<T>
+  ): Promise<T> {
+    if (this.options.lockMode === 'none') {
+      return action();
+    }
+
+    if (this.options.lockMode === 'flock' && !this.flockWarningEmitted) {
+      this.options.log?.warn?.('flock lockMode requested; falling back to lockfile', {
+        collection
+      });
+      this.flockWarningEmitted = true;
+    }
+
+    const lock = new FileLock({
+      path: this.getCollectionLockPath(collection),
+      retryMs: this.options.lockRetryMs,
+      timeoutMs: this.options.lockTimeoutMs
+    });
+
+    await lock.acquire();
+    try {
+      return await action();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  private getCollectionLockPath(collection: string): string {
+    return path.join(this.options.dataDir, `${collection}.lock`);
   }
 
   async saveBinary(
@@ -390,7 +550,7 @@ class JsonFileDatabase implements Database {
     const shouldWrite = !dedupe || !exists;
 
     if (shouldWrite) {
-      await fsp.writeFile(filePath, buffer);
+      await writeFileWithSync(filePath, buffer, this.options.fsync === 'never' ? 'never' : 'batch');
     }
 
     const now = new Date().toISOString();
@@ -525,7 +685,11 @@ class JsonFileDatabase implements Database {
     state: CollectionState,
     entry: Record<string, unknown>
   ): Promise<void> {
-    await fsp.appendFile(state.logPath, `${JSON.stringify(entry)}\n`, 'utf8');
+    await appendFileWithSync(
+      state.logPath,
+      `${JSON.stringify(entry)}\n`,
+      this.options.fsync
+    );
     state.writesSinceSnapshot += 1;
 
     const interval = this.options.snapshotInterval ?? 0;
@@ -548,7 +712,11 @@ class JsonFileDatabase implements Database {
       await this.normalizeAndValidateDocument(collection, doc, false);
     }
     const snapshotPayload = JSON.stringify({ docs }, null, 2);
-    await fsp.writeFile(state.snapshotPath, snapshotPayload, 'utf8');
+    await writeFileWithSync(
+      state.snapshotPath,
+      snapshotPayload,
+      this.options.fsync === 'never' ? 'never' : 'batch'
+    );
 
     let checkpoint = await getFileSize(state.logPath);
 
@@ -561,7 +729,11 @@ class JsonFileDatabase implements Database {
         collection,
         rotatedPath
       });
-      await fsp.writeFile(state.logPath, '', 'utf8');
+      await writeFileWithSync(
+        state.logPath,
+        '',
+        this.options.fsync === 'never' ? 'never' : 'batch'
+      );
       checkpoint = 0;
     }
 
@@ -596,10 +768,10 @@ class JsonFileDatabase implements Database {
 
   private async persistManifest(manifest: Manifest): Promise<void> {
     this.manifest = manifest;
-    await fsp.writeFile(
+    await writeFileWithSync(
       this.manifestPath,
       JSON.stringify(manifest, null, 2),
-      'utf8'
+      this.options.fsync === 'never' ? 'never' : 'batch'
     );
   }
 
@@ -680,10 +852,10 @@ class JsonFileDatabase implements Database {
     entries: Record<string, DocumentId[]>
   ): Promise<IndexMetadata> {
     await ensureIndexDirectory(meta.path);
-    await fsp.writeFile(
+    await writeFileWithSync(
       meta.path,
       JSON.stringify({ meta, entries }, null, 2),
-      'utf8'
+      this.options.fsync === 'never' ? 'never' : 'batch'
     );
 
     const sizeBytes = await getFileSize(meta.path);
@@ -1159,18 +1331,24 @@ function resolveOptions(options: DatabaseOptions): ResolvedOptions {
   const binaryDir =
     options.binaryDir ?? path.resolve(process.cwd(), 'binaries');
   const indexDir = options.indexDir ?? path.join(dataDir, 'indexes');
+  const logDir = options.logDir ?? path.join(dataDir, 'logs');
   const tokenizer = resolveTokenizer(options.tokenizer);
   return {
     ...options,
     dataDir,
     binaryDir,
+    logDir,
     indexDir,
     tokenizer,
     schemas: options.schemas ?? {},
-    log: options.log ?? noopLogger,
+    log: options.log ?? createFileLogger(logDir),
     autoCompact: options.autoCompact ?? true,
     snapshotInterval: options.snapshotInterval ?? 100,
     logRetention: options.logRetention ?? 'truncate',
+    fsync: options.fsync ?? 'batch',
+    lockMode: options.lockMode ?? 'lockfile',
+    lockRetryMs: options.lockRetryMs ?? 25,
+    lockTimeoutMs: options.lockTimeoutMs ?? 2000,
     joinCacheMaxEntries: options.joinCacheMaxEntries ?? 1000,
     joinCacheTTLms: options.joinCacheTTLms,
     dedupeBinaries: options.dedupeBinaries ?? true
@@ -1411,6 +1589,44 @@ function ensureDirectories(options: ResolvedOptions): void {
   fs.mkdirSync(options.dataDir, { recursive: true });
   fs.mkdirSync(options.binaryDir, { recursive: true });
   fs.mkdirSync(options.indexDir, { recursive: true });
+  fs.mkdirSync(options.logDir, { recursive: true });
+}
+
+async function appendFileWithSync(
+  filePath: string,
+  content: string,
+  fsyncMode: 'always' | 'batch' | 'never'
+): Promise<void> {
+  const handle = await fsp.open(filePath, 'a');
+  try {
+    await handle.writeFile(content, { encoding: 'utf8' });
+    if (fsyncMode === 'always') {
+      await handle.sync();
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+async function writeFileWithSync(
+  filePath: string,
+  content: string | Buffer,
+  fsyncMode: 'always' | 'batch' | 'never'
+): Promise<void> {
+  const handle = await fsp.open(filePath, 'w');
+  try {
+    if (typeof content === 'string') {
+      await handle.writeFile(content, { encoding: 'utf8' });
+    } else {
+      await handle.writeFile(content);
+    }
+
+    if (fsyncMode !== 'never') {
+      await handle.sync();
+    }
+  } finally {
+    await handle.close();
+  }
 }
 
 function normalizeIndexOptions(
@@ -1461,7 +1677,8 @@ async function ensureIndexDirectory(indexPath: string): Promise<void> {
 
 async function writeIndexStub(
   indexPath: string,
-  metadata: IndexMetadata
+  metadata: IndexMetadata,
+  fsyncMode: 'always' | 'batch' | 'never'
 ): Promise<void> {
   const payload = {
     meta: {
@@ -1478,7 +1695,11 @@ async function writeIndexStub(
   };
 
   await ensureIndexDirectory(indexPath);
-  await fsp.writeFile(indexPath, JSON.stringify(payload, null, 2), 'utf8');
+  await writeFileWithSync(
+    indexPath,
+    JSON.stringify(payload, null, 2),
+    fsyncMode === 'never' ? 'never' : 'batch'
+  );
 }
 
 async function loadIndexFile(indexPath: string): Promise<IndexFilePayload | null> {
@@ -2062,6 +2283,10 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
+async function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function readLog(
   filePath: string,
   offset = 0
@@ -2160,6 +2385,15 @@ function isEnoentError(error: unknown): boolean {
 
   const code = (error as { code?: unknown }).code;
   return code === 'ENOENT';
+}
+
+function isEexistError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+
+  const code = (error as { code?: unknown }).code;
+  return code === 'EEXIST';
 }
 
 export function createDatabase(options: DatabaseOptions = {}): Database {

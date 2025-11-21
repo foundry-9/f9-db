@@ -179,6 +179,7 @@ export interface Logger {
 export interface DatabaseOptions {
   dataDir?: string;
   binaryDir?: string;
+  logDir?: string;
   log?: Logger;
   autoCompact?: boolean;
   snapshotInterval?: number;
@@ -190,6 +191,9 @@ export interface DatabaseOptions {
   joinCacheMaxEntries?: number;
   joinCacheTTLms?: number;
   dedupeBinaries?: boolean;
+  lockMode?: 'lockfile' | 'flock' | 'none';
+  lockRetryMs?: number;
+  lockTimeoutMs?: number;
 }
 
 export interface Database {
