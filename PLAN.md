@@ -9,18 +9,22 @@
 - Logging is always on (structured JSON logs).
 - Targeted for drop-in use in Node.js 22.x backends (Express/Next.js/Electron/etc).
 
+## Progress Notes
+
+- Core schema validation implemented: schemas provided at init are stored in the manifest, defaults applied on insert, unexpected fields rejected, and type/constraint checks run on insert/update and during compaction.
+
 ## High-Level Design
 
 - **Collections**: Each collection stored as append-only JSONL log (`data/<collection>.jsonl`) plus compacted snapshot (`data/<collection>.snapshot.json`). Each line is `{_id, data, meta}` for writes, or `{_id, tombstone:true}` for deletes.
-- **Indexes**: Per-collection index files in `data/indexes/<collection>/<field>.json`. String fields use an inverted index map of normalized tokens → sorted array of `_id`s. A small LRU cache holds hot posting lists in-memory. Composite indexes supported by storing joined field tokens.
-- **Binary store**: Opaque binaries stored under `binaries/` as hashed filenames (e.g., `<sha256>`), with references from documents (e.g., `_binRefs: [{field, sha256, size, mime}]`).
-- **Metadata**: `data/manifest.json` maintains collection schemas (optional), index definitions, and last compaction offsets.
+- **Indexes**: Per-collection index files in `data/indexes/<collection>/<field>.json`. String fields use an inverted index map of normalized tokens → sorted array of `_id`s. A small LRU cache holds hot posting lists in-memory. Composite indexes supported by storing joined field tokens. Unique constraints are backed by their corresponding indexes.
+- **Binary store**: Opaque binaries stored under `binaries/` as hashed filenames (e.g., `<sha256>`), with references from documents (e.g., `_binRefs: [{field, sha256, size, mime}]`). Deduplication on by default (sha256); opt-out supported.
+- **Metadata**: `data/manifest.json` maintains rigid collection schemas, constraints, index definitions, last compaction offsets, and manifest/schema versions.
 - **API Surface (ES module)**:
   - `db = createDatabase(opts)`; opts include `dataDir`, `binaryDir`, `log`, `serializer`.
   - CRUD: `insert(collection, doc)`, `get(collection, id)`, `update(collection, id, mutation)`, `remove(collection, id)`.
   - Query: `find(collection, filter, opts)`, `stream(collection, filter, opts) -> AsyncIterator` (yields JSONL).
   - Index mgmt: `ensureIndex(collection, field, options)`, `rebuildIndex`.
-  - Relational helpers: `join(collection, doc, relations)` that pulls referenced docs into nested shapes.
+  - Relational helpers: `join(collection, doc, relations)` that pulls referenced docs into nested shapes with configurable cache size/TTL and manual `clearJoinCache`.
 - **Output formats**:
   - Default `find` returns JSON array/object.
   - `stream`/`export` returns UTF-8 JSONL chunked results for large scans.
@@ -32,9 +36,24 @@
 - `data/<collection>.jsonl` — append-only operation log.
 - `data/<collection>.snapshot.json` — compacted full state (periodic).
 - `data/indexes/<collection>/<field>.json` — inverted index for string fields; may store bloom filter metadata.
-- `data/manifest.json` — collection/index metadata + compaction checkpoints.
+- `data/manifest.json` — collection/index metadata, schema/manifest versions, + compaction checkpoints.
 - `binaries/` — hashed binary blobs.
 - `logs/app.log` — JSON logs (rotated).
+
+## Schema & Constraints
+
+- **Schema model**: Every collection/table declares a rigid schema with defined fields and types. The only flexible field type is `json` (opaque payload); all other fields must be declared (string, number, boolean, date/iso-string, binary ref, array/object of typed fields).
+- **Constraints**:
+  - Required/not-null fields validated on write.
+  - Type validation enforced on insert/update; rejects mismatches.
+  - String constraints: min/max length, regex, enum.
+  - Number constraints: min/max, integer-only flag.
+  - Array constraints: item type validation; min/max length.
+  - Object constraints: nested rigid schema unless type is `json`.
+  - Uniqueness: per-field or composite unique constraints enforced via index + manifest metadata.
+  - Defaults: applied on insert when omitted.
+- **Schema storage**: Manifest stores per-collection schema, constraints, defaults, indexes, and unique keys. Versioning supports migrations.
+- **Validation timing**: On insert/update; compaction re-validates and can emit warnings for corrupt rows before repairing.
 
 ## Data & Index Strategy
 
@@ -43,7 +62,7 @@
   - Periodically fold log into snapshot to drop tombstones and stale versions.
   - Record last processed offset in manifest; use it to resume on startup.
 - **Indexes**:
-  - Tokenizer: lowercase, split on non-alphanumerics, optional min length; store tokens.
+  - Tokenizer: lowercase, split on non-alphanumerics, min length 2; stemming off by default; allow user hook for custom tokenizers.
   - Structure: `{ token: [id1, id2, ...] }` persisted as JSON with chunked arrays to avoid huge single strings.
   - Optional **prefix index**: store leading `N` chars token for starts-with queries.
   - Rebuild on demand or during compaction; incremental updates on CRUD.
@@ -64,8 +83,8 @@
 
 ## Concurrency/Safety
 
-- Single-writer lock per collection file (advisory via `fs` file lock or mutex in process).
-- Multi-process safety: use `flock`/lockfile where supported; otherwise warn and default to single-process usage.
+- Single-writer lock per collection file using JS lockfile with retry/backoff for portability.
+- Multi-process safety: optional `flock` mode via feature flag (`lockMode: "lockfile" | "flock"`, default `lockfile`).
 - Crash recovery: on startup, replay from snapshot + log; rebuild indexes that are behind.
 
 ## Configuration Options
@@ -73,9 +92,11 @@
 - `dataDir`, `binaryDir`, `logDir`
 - `autoCompact` (boolean/threshold), `compactInterval`, `maxLogBytes`
 - `fsync` mode: `always` | `batch` | `never` (with risk)
-- `index`: tokenizer settings, prefix length, stopwords (optional)
+- `index`: tokenizer settings (min length 2, lowercase, no stemming), prefix length, stopwords (optional), custom tokenizer hook
+- `manifestVersion` (start 1) and per-collection schema/index versioning
 - `limits`: max document size, max result size, stream chunk size
 - `serialization`: custom replacer/reviver for JSON
+- `dedupeBinaries`: default true (sha256-based), can disable
 
 ## Performance Plan
 
@@ -97,9 +118,9 @@
 - Provide TypeScript types via `d.ts`.
 - Add examples for Express middleware and Next.js route handler.
 
-## Open Questions / Decisions
+## Decisions Recorded
 
-- Locking mechanism choice (pure JS lockfile vs. advisory `flock`).
-- Index tokenization: include stemming? (default no, keep simple).
-- Binary deduplication: default on via sha256 hash comparison.
-- Manifest format versioning to allow future migrations.
+- Locking: default JS lockfile with retry/backoff; optional `flock` mode via `lockMode`.
+- Tokenization: lowercase + non-alphanumerics split, min length 2, no stemming by default; custom tokenizer hook allowed.
+- Binary deduplication: default on via sha256 hashing with option to disable.
+- Manifest versioning: include `manifestVersion` (start at 1) and per-collection `schemaVersion`/index versions for migrations.
