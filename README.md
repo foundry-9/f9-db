@@ -2,6 +2,8 @@
 
 File-backed database intended as a drop-in for Node/Express/Next.js/Electron backends. Uses append-only JSONL logs, periodic snapshots, and simple inverted indexes for fast string search. Responses are always JSON or JSONL; logging is built-in.
 
+> 📘 Start with the [SQL-to-f9 guide](docs/sql-to-f9-db.md) to translate SQL schemas/queries, then dig into the [API Guide](docs/API.md) for every method and option.
+
 ## What This Is
 
 - Pure Node 22.x (ESM) library, no native deps.
@@ -11,6 +13,12 @@ File-backed database intended as a drop-in for Node/Express/Next.js/Electron bac
 - Supports relational-style joins to return nested objects/arrays.
 - Streams large results as JSONL; regular queries return JSON.
 - Structured JSON logging everywhere.
+
+## Documentation & Guides
+
+- [API Guide](docs/API.md) — full reference for options, methods, and workflows.
+- [SQL-to-f9 guide](docs/sql-to-f9-db.md) — translate SQL schemas/queries to f9 primitives.
+- [Custom types](docs/custom-types.md) — extend the built-in scalar types and validators.
 
 ## Why (Quilltap Context)
 

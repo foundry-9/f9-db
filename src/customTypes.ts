@@ -43,6 +43,10 @@ function normalizeFloat(value: unknown): number {
 
 const DECIMAL_REGEX = /^[+-]?\d+(?:\.\d+)?$/;
 
+/**
+ * Normalize raw numbers/strings into canonical decimal strings without scientific notation.
+ * Rejects non-decimal inputs so the stored value can be compared lexically.
+ */
 function normalizeDecimalString(value: unknown): string {
   if (typeof value !== 'string' && typeof value !== 'number') {
     throw new TypeError('Decimal inputs must be a string or number');
@@ -91,6 +95,10 @@ function compareFractionalParts(leftFrac: string, rightFrac: string, sign: numbe
   return applySign(fracComparison < 0 ? -1 : 1, sign);
 }
 
+/**
+ * Decimal-safe comparator that orders canonical decimal strings without losing precision.
+ * Falls back to `null` when either side is not a decimal string.
+ */
 function compareDecimalStrings(left: ComparableValue, right: ComparableValue): number | null {
   if (typeof left !== 'string' || typeof right !== 'string') {
     return null;
@@ -174,6 +182,12 @@ const varcharType: CustomTypeDefinition<string, string> = {
   project: (value) => value
 };
 
+/**
+ * Build the default custom type registry, optionally overriding any built-in definitions.
+ *
+ * @param overrides Custom type overrides or additions keyed by type name.
+ * @returns Combined registry that includes built-in and user-provided types.
+ */
 export function createDefaultCustomTypes(
   overrides: CustomTypeRegistry = {}
 ): CustomTypeRegistry {
@@ -186,4 +200,7 @@ export function createDefaultCustomTypes(
   };
 }
 
+/**
+ * Export decimal normalization/comparison helpers so consumers can reuse them in custom types.
+ */
 export { normalizeDecimalString, compareDecimalStrings };

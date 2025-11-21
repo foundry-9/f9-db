@@ -3845,6 +3845,13 @@ function isEexistError(error: unknown): boolean {
   return code === 'EEXIST';
 }
 
+/**
+ * Create or open a file-backed database instance backed by JSONL logs, manifests, and indexes.
+ * This eagerly validates options, prepares directories, and lazily loads collections on demand.
+ *
+ * @param options Database-level configuration such as storage paths, schemas, and durability knobs.
+ * @returns Database interface with CRUD, query, binary, and maintenance helpers.
+ */
 export function createDatabase(options: DatabaseOptions = {}): Database {
   return new JsonFileDatabase(options);
 }

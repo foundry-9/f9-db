@@ -1,5 +1,9 @@
+/** Unique identifier assigned to each stored document. */
 export type DocumentId = string;
 
+/**
+ * JSON-compatible value used for defaults, schema literals, and arbitrary payloads.
+ */
 export type JsonValue =
   | string
   | number
@@ -8,11 +12,16 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
+/**
+ * Core document shape persisted in collections. `_id` is optional on insert and `_binRefs`
+ * tracks related binary attachments.
+ */
 export interface Document extends Record<string, unknown> {
   _id?: DocumentId;
   _binRefs?: BinaryReference[];
 }
 
+/** Allowed primitive field types when defining a schema. */
 export type FieldType =
   | 'string'
   | 'number'
@@ -23,12 +32,14 @@ export type FieldType =
   | 'json'
   | 'custom';
 
+/** Options shared by all schema field definitions. */
 export interface BaseFieldSchema {
   type: FieldType;
   required?: boolean;
   default?: JsonValue;
 }
 
+/** Schema definition for strings with optional length/pattern constraints. */
 export interface StringFieldSchema extends BaseFieldSchema {
   type: 'string';
   minLength?: number;
@@ -37,6 +48,7 @@ export interface StringFieldSchema extends BaseFieldSchema {
   enum?: string[];
 }
 
+/** Schema definition for numeric fields (integers or floats). */
 export interface NumberFieldSchema extends BaseFieldSchema {
   type: 'number';
   min?: number;
@@ -44,19 +56,23 @@ export interface NumberFieldSchema extends BaseFieldSchema {
   integer?: boolean;
 }
 
+/** Schema definition for booleans. */
 export interface BooleanFieldSchema extends BaseFieldSchema {
   type: 'boolean';
 }
 
+/** Schema definition for ISO date strings/Date instances. */
 export interface DateFieldSchema extends BaseFieldSchema {
   type: 'date';
 }
 
+/** Schema definition for nested objects with per-field sub-schemas. */
 export interface ObjectFieldSchema extends BaseFieldSchema {
   type: 'object';
   fields: Record<string, FieldSchema>;
 }
 
+/** Schema definition for homogeneous arrays. */
 export interface ArrayFieldSchema extends BaseFieldSchema {
   type: 'array';
   items: FieldSchema;
@@ -64,10 +80,12 @@ export interface ArrayFieldSchema extends BaseFieldSchema {
   maxItems?: number;
 }
 
+/** Schema definition for flexible JSON blobs with no validation. */
 export interface JsonFieldSchema extends BaseFieldSchema {
   type: 'json';
 }
 
+/** Schema definition that references a custom type implementation. */
 export interface CustomFieldSchema extends BaseFieldSchema {
   type: 'custom';
   customType: string;
@@ -77,6 +95,7 @@ export interface CustomFieldSchema extends BaseFieldSchema {
   options?: Record<string, unknown>;
 }
 
+/** Union of supported schema definitions. */
 export type FieldSchema =
   | StringFieldSchema
   | NumberFieldSchema
@@ -87,12 +106,17 @@ export type FieldSchema =
   | JsonFieldSchema
   | CustomFieldSchema;
 
+/** Describes the schema for a collection/table. */
 export interface CollectionSchema {
   fields: Record<string, FieldSchema>;
 }
 
+/** Primitive values that can participate in comparisons and filtering. */
 export type ComparableValue = string | number | boolean | null | Date;
 
+/**
+ * Declarative contract for custom field types that plug into validation/comparison logic.
+ */
 export interface CustomTypeDefinition<Internal = unknown, Projected = unknown> {
   name: string;
   description?: string;
@@ -129,8 +153,10 @@ export interface CustomTypeDefinition<Internal = unknown, Projected = unknown> {
   accepts?: string[];
 }
 
+/** Map of custom type names to their definitions. */
 export type CustomTypeRegistry = Record<string, CustomTypeDefinition<unknown, unknown>>;
 
+/** Supported per-field filter operations. */
 export interface FieldOperator {
   $eq?: ComparableValue;
   $ne?: ComparableValue;
@@ -148,8 +174,10 @@ export interface FieldOperator {
   $not?: FieldPredicate;
 }
 
+/** Filter predicate for a single field (value, operator expression, or array). */
 export type FieldPredicate = ComparableValue | ComparableValue[] | FieldOperator;
 
+/** Root filter shape supporting nested fields and boolean combinations. */
 export interface Filter {
   [field: string]: FieldPredicate | Filter | Filter[] | undefined;
   $and?: Filter[];
@@ -157,6 +185,7 @@ export interface Filter {
   $not?: Filter;
 }
 
+/** Additional options that control `find` and `stream` queries. */
 export interface FindOptions {
   limit?: number;
   skip?: number;
@@ -175,30 +204,39 @@ export interface FindOptions {
   diagnostics?: (stats: StreamDiagnostics) => void;
 }
 
+/** Mutation payload applied during `update` or `updateWhere`. */
 export type UpdateMutation = Partial<Document> | ((doc: Document) => Partial<Document>);
 
+/** Supported pagination options during `updateWhere`. */
 export type UpdateWhereOptions = Pick<FindOptions, 'limit' | 'skip' | 'sort'>;
+/** Supported pagination options during `removeWhere`. */
 export type RemoveWhereOptions = Pick<FindOptions, 'limit' | 'skip' | 'sort'>;
 
+/** Aggregate operations available in queries. */
 export type AggregateOperator = 'count' | 'sum' | 'avg' | 'min' | 'max';
 
+/** Definition of a single aggregate computed during `find`. */
 export interface AggregateDefinition {
   op: AggregateOperator;
   field?: string;
 }
 
+/** Options for `ROW_NUMBER()` style calculations. */
 export interface RowNumberOptions {
   as?: string;
   orderBy?: Record<string, 1 | -1>;
 }
 
+/** User-facing index creation options. */
 export interface IndexOptions {
   unique?: boolean;
   prefixLength?: number;
 }
 
+/** Lifecycle state emitted for index metadata. */
 export type IndexState = 'pending' | 'ready' | 'stale' | 'error';
 
+/** Tokenizer configuration leveraged by text indexes. */
 export interface TokenizerOptions {
   lowerCase: boolean;
   minTokenLength: number;
@@ -206,12 +244,14 @@ export interface TokenizerOptions {
   stopwords: string[];
 }
 
+/** Fully normalized index options persisted in manifests. */
 export interface NormalizedIndexOptions {
   unique: boolean;
   prefixLength?: number;
   tokenizer: TokenizerOptions;
 }
 
+/** Basic stats reported for each index. */
 export interface IndexStats {
   docCount: number;
   tokenCount: number;
@@ -219,6 +259,7 @@ export interface IndexStats {
   builtAt?: string;
 }
 
+/** Manifest metadata describing a single index. */
 export interface IndexMetadata {
   field: string;
   path: string;
@@ -232,6 +273,7 @@ export interface IndexMetadata {
   stats?: IndexStats;
 }
 
+/** Configuration for a single join between collections. */
 export interface JoinRelation {
   localField: string;
   foreignCollection: string;
@@ -241,8 +283,10 @@ export interface JoinRelation {
   projection?: string[];
 }
 
+/** Join definitions keyed by field alias. */
 export type JoinRelations = Record<string, JoinRelation | JoinRelation[]>;
 
+/** Reference to a binary attachment associated with a document field. */
 export interface BinaryReference {
   field: string;
   sha256: string;
@@ -250,6 +294,7 @@ export interface BinaryReference {
   mimeType?: string;
 }
 
+/** Metadata describing saved binary blobs. */
 export interface BinaryMetadata {
   sha256: string;
   size: number;
@@ -261,15 +306,18 @@ export interface BinaryMetadata {
   deduped?: boolean;
 }
 
+/** Options for saving binary data (e.g., MIME type hints). */
 export interface BinaryWriteOptions {
   mimeType?: string;
   dedupe?: boolean;
 }
 
+/** Options provided when deleting binaries. */
 export interface BinaryDeleteOptions {
   force?: boolean;
 }
 
+/** Diagnostics produced when scanning documents for a query/stream. */
 export interface StreamDiagnostics {
   scannedDocs: number;
   matchedDocs: number;
@@ -277,6 +325,7 @@ export interface StreamDiagnostics {
   maxBufferedDocs: number;
 }
 
+/** Structured logger implementation passed into the database. */
 export interface Logger {
   debug?: (msg: string, context?: Record<string, unknown>) => void;
   info?: (msg: string, context?: Record<string, unknown>) => void;
@@ -284,74 +333,110 @@ export interface Logger {
   error?: (msg: string, context?: Record<string, unknown>) => void;
 }
 
+/** Options accepted by `createDatabase`. */
 export interface DatabaseOptions {
+  /** Directory used for manifests, snapshots, logs, and indexes (defaults to `./data`). */
   dataDir?: string;
+  /** Directory dedicated to binary blobs (defaults to `./binaries`). */
   binaryDir?: string;
+  /** Directory for JSON log files written by the default logger. */
   logDir?: string;
+  /** Custom logger implementation for structured logs. */
   log?: Logger;
+  /** When true, collections automatically compact after accumulating writes. */
   autoCompact?: boolean;
+  /** Number of writes between automatic snapshots (defaults to 1000). */
   snapshotInterval?: number;
+  /** Determines how to handle collection logs when snapshots run. */
   logRetention?: 'truncate' | 'rotate' | 'keep';
+  /** Durability level for fsync operations (`always`, `batch`, or `never`). */
   fsync?: 'always' | 'batch' | 'never';
+  /** Directory that holds index data (defaults to `${dataDir}/indexes`). */
   indexDir?: string;
+  /** Override default tokenizer behavior for text indexes. */
   tokenizer?: Partial<TokenizerOptions>;
+  /** Strict schemas per collection enforced on insert/update. */
   schemas?: Record<string, CollectionSchema>;
+  /** Maximum number of entries stored in the join cache. */
   joinCacheMaxEntries?: number;
+  /** Optional time-to-live for join cache entries in milliseconds. */
   joinCacheTTLms?: number;
+  /** Toggle binary deduplication behavior (default true). */
   dedupeBinaries?: boolean;
+  /** Locking mechanism for coordinating multiple writers. */
   lockMode?: 'lockfile' | 'flock' | 'none';
+  /** Milliseconds to wait between lock acquisition retries. */
   lockRetryMs?: number;
+  /** Milliseconds before lock acquisition gives up and throws. */
   lockTimeoutMs?: number;
+  /** Custom type registry for schema validation/parsing. */
   customTypes?: CustomTypeRegistry;
 }
 
+/** Runtime contract returned by `createDatabase`. */
 export interface Database {
+  /** Insert a single document into the target collection. */
   insert: (collection: string, doc: Document) => Promise<Document>;
+  /** Retrieve a document by `_id`, returning `null` when it does not exist. */
   get: (collection: string, id: DocumentId) => Promise<Document | null>;
+  /** Update a document by `_id` using a partial object or mutation function. */
   update: (
     collection: string,
     id: DocumentId,
     mutation: UpdateMutation
   ) => Promise<Document>;
+  /** Apply a mutation to every document that matches the provided filter. */
   updateWhere: (
     collection: string,
     mutation: UpdateMutation,
     filter: Filter,
     options?: UpdateWhereOptions
   ) => Promise<Document[]>;
+  /** Remove every document that matches the filter and return deleted rows. */
   removeWhere: (
     collection: string,
     filter?: Filter,
     options?: RemoveWhereOptions
   ) => Promise<Document[]>;
+  /** Delete a single document by `_id`. */
   remove: (collection: string, id: DocumentId) => Promise<void>;
+  /** Find documents, optionally with projections, sorting, grouping, and aggregates. */
   find: (
     collection: string,
     filter?: Filter,
     options?: FindOptions
   ) => Promise<Document[]>;
+  /** Stream JSONL rows for very large result sets. */
   stream: (
     collection: string,
     filter?: Filter,
     options?: FindOptions
   ) => AsyncIterable<string>;
+  /** Build or update an index to speed lookups and enforce uniqueness. */
   ensureIndex: (
     collection: string,
     field: string,
     options?: IndexOptions
   ) => Promise<void>;
+  /** Force a full rebuild of the specified index. */
   rebuildIndex: (collection: string, field: string) => Promise<void>;
+  /** Resolve referenced documents across collections, returning a hydrated doc. */
   join: (
     collection: string,
     doc: Document,
     relations: JoinRelations
   ) => Promise<Document>;
+  /** Compact the underlying log/snapshot for the given collection. */
   compact: (collection: string) => Promise<void>;
+  /** Clear the join cache, forcing the next join to refetch dependencies. */
   clearJoinCache: () => void;
+  /** Save binary data and return metadata describing the stored blob. */
   saveBinary: (
     data: Buffer | ArrayBuffer | Uint8Array | string,
     options?: BinaryWriteOptions
   ) => Promise<BinaryMetadata>;
+  /** Read binary data by SHA-256 hash. Returns `null` when not found. */
   readBinary: (sha256: string) => Promise<Buffer | null>;
+  /** Delete binary data, optionally forcing the removal even with outstanding references. */
   deleteBinary: (sha256: string, options?: BinaryDeleteOptions) => Promise<boolean>;
 }
