@@ -1,0 +1,29 @@
+# Source files
+src/
+tests/
+
+# Configuration files
+tsconfig.json
+tsconfig.eslint.json
+jest.config.js
+eslint.config.js
+sonar-project.properties
+
+# Documentation (keep README.md)
+PLAN.md
+Quilltap.md
+docs/
+
+# Build artifacts
+coverage/
+*.log
+logs/
+
+# Development files
+.DS_Store
+.eslintcache
+.turbo
+node_modules/
+
+# GitHub specific
+.github/
