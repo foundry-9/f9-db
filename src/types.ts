@@ -20,7 +20,8 @@ export type FieldType =
   | 'date'
   | 'object'
   | 'array'
-  | 'json';
+  | 'json'
+  | 'custom';
 
 export interface BaseFieldSchema {
   type: FieldType;
@@ -67,6 +68,15 @@ export interface JsonFieldSchema extends BaseFieldSchema {
   type: 'json';
 }
 
+export interface CustomFieldSchema extends BaseFieldSchema {
+  type: 'custom';
+  customType: string;
+  /**
+   * Arbitrary options forwarded to the custom type definition (e.g., { maxLength: 128 }).
+   */
+  options?: Record<string, unknown>;
+}
+
 export type FieldSchema =
   | StringFieldSchema
   | NumberFieldSchema
@@ -74,13 +84,52 @@ export type FieldSchema =
   | DateFieldSchema
   | ObjectFieldSchema
   | ArrayFieldSchema
-  | JsonFieldSchema;
+  | JsonFieldSchema
+  | CustomFieldSchema;
 
 export interface CollectionSchema {
   fields: Record<string, FieldSchema>;
 }
 
 export type ComparableValue = string | number | boolean | null | Date;
+
+export interface CustomTypeDefinition<Internal = unknown, Projected = unknown> {
+  name: string;
+  description?: string;
+  /**
+   * Used purely for docs/error messaging to hint at the base primitive.
+   */
+  baseType: 'string' | 'number' | 'boolean' | 'date' | 'json';
+  /**
+   * Normalize/coerce user input (or defaults) into the internal representation that will be
+   * persisted in the database.
+   */
+  fromInput: (value: unknown, options?: Record<string, unknown>) => Internal;
+  /**
+   * Convert the stored internal value into something that can be compared/sorted/filtered.
+   * If omitted, the internal value is used directly.
+   */
+  toComparable?: (value: Internal, options?: Record<string, unknown>) => ComparableValue;
+  /**
+   * Optional comparator for cases where string/number comparison is not sufficient
+   * (e.g., lexical-safe decimal comparison).
+   */
+  compare?: (
+    left: ComparableValue,
+    right: ComparableValue,
+    options?: Record<string, unknown>
+  ) => number | null;
+  /**
+   * Build the projected value returned to callers. Defaults to the internal value.
+   */
+  project?: (value: Internal, options?: Record<string, unknown>) => Projected;
+  /**
+   * Human-friendly hint of acceptable inputs (used only in docs/error messages).
+   */
+  accepts?: string[];
+}
+
+export type CustomTypeRegistry = Record<string, CustomTypeDefinition<unknown, unknown>>;
 
 export interface FieldOperator {
   $eq?: ComparableValue;
@@ -254,6 +303,7 @@ export interface DatabaseOptions {
   lockMode?: 'lockfile' | 'flock' | 'none';
   lockRetryMs?: number;
   lockTimeoutMs?: number;
+  customTypes?: CustomTypeRegistry;
 }
 
 export interface Database {

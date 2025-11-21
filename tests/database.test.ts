@@ -566,6 +566,47 @@ describe('JsonFileDatabase', () => {
     ).rejects.toThrow(/must be a number/);
   });
 
+  test('custom types normalize input, enforce constraints, and project values', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({
+      dataDir,
+      binaryDir,
+      schemas: {
+        orders: {
+          fields: {
+            amount: { type: 'custom', customType: 'decimal', required: true },
+            code: { type: 'custom', customType: 'varchar', options: { maxLength: 4 } },
+            visits: { type: 'custom', customType: 'int' }
+          }
+        }
+      }
+    });
+
+    const first = await db.insert('orders', { amount: '10.50', code: 'OK', visits: '5' });
+    expect(first.amount).toBe('10.5'); // stored canonical string
+    expect(typeof first.visits).toBe('number');
+
+    await db.insert('orders', { amount: '002.500', code: 'ABCD' });
+    await db.insert('orders', { amount: 2, code: 'EFGH' });
+
+    await expect(db.insert('orders', { amount: '1', code: 'TOO LONG' })).rejects.toThrow(
+      /maxLength=4/
+    );
+    await expect(db.insert('orders', { amount: '3.14', visits: 'abc' })).rejects.toThrow(
+      /safe integer|number/i
+    );
+
+    const sorted = await db.find('orders', {}, { sort: { amount: 1 } });
+    expect(sorted.map((o) => o.amount)).toEqual([2, 2.5, 10.5]); // projected as numbers
+
+    const filtered = await db.find('orders', { amount: { $gt: '2.1' } }, { sort: { amount: 1 } });
+    expect(filtered.map((o) => o.amount)).toEqual([2.5, 10.5]);
+
+    // ensure projection still includes canonical _id and code
+    expect(filtered[0]?._id).toBeDefined();
+    expect(filtered[0]?.code).toBe('ABCD');
+  });
+
   test('join resolves relations with batching and projection', async () => {
     ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });

@@ -24,8 +24,12 @@ import type {
   BinaryDeleteOptions,
   BinaryReference,
   AggregateDefinition,
-  RowNumberOptions
+  RowNumberOptions,
+  ComparableValue,
+  CustomTypeRegistry,
+  CustomTypeDefinition
 } from './types.js';
+import { createDefaultCustomTypes } from './customTypes.js';
 
 interface ResolvedOptions extends DatabaseOptions {
   dataDir: string;
@@ -43,6 +47,7 @@ interface ResolvedOptions extends DatabaseOptions {
   joinCacheMaxEntries: number;
   joinCacheTTLms?: number;
   dedupeBinaries: boolean;
+  customTypes: CustomTypeRegistry;
 }
 
 interface CollectionState {
@@ -278,6 +283,7 @@ class JsonFileDatabase implements Database {
     options: FindOptions = {}
   ): Promise<Document[]> {
     const state = await this.loadCollection(collection);
+    const schema = await this.getCollectionSchema(collection);
     const {
       limit = Infinity,
       skip = 0,
@@ -298,13 +304,21 @@ class JsonFileDatabase implements Database {
           .filter(Boolean) as Document[]
       : Array.from(state.docs.values());
 
-    let results = docsToScan.filter((doc) => matchesFilter(doc, filter));
+    let results = docsToScan.filter((doc) =>
+      matchesFilter(doc, filter, schema, this.options.customTypes)
+    );
     const groupingRequested =
       (Array.isArray(groupBy) && groupBy.length > 0) ||
       (aggregates && Object.keys(aggregates).length > 0);
 
     if (groupingRequested) {
-      results = groupDocuments(results, groupBy ?? [], aggregates);
+      results = groupDocuments(
+        results,
+        groupBy ?? [],
+        aggregates,
+        schema,
+        this.options.customTypes
+      );
     }
 
     if (normalizedRowNumber) {
@@ -312,17 +326,25 @@ class JsonFileDatabase implements Database {
         results,
         partitionBy ?? [],
         sort,
-        normalizedRowNumber
+        normalizedRowNumber,
+        schema,
+        this.options.customTypes
       );
     } else if (sortKeys.length > 0) {
       results = results.sort((left, right) =>
-        compareDocuments(left, right, sort as Record<string, 1 | -1>)
+        compareDocuments(
+          left,
+          right,
+          sort as Record<string, 1 | -1>,
+          schema,
+          this.options.customTypes
+        )
       );
     }
 
     return results
       .slice(skip, skip + limit)
-      .map((doc) => projectDocument(doc, projection));
+      .map((doc) => projectDocument(doc, projection, schema, this.options.customTypes));
   }
 
   async *stream(
@@ -338,6 +360,7 @@ class JsonFileDatabase implements Database {
       diagnostics,
       streamFromFiles
     } = options;
+    const schema = await this.getCollectionSchema(collection);
     const sortKeys = sort ? Object.keys(sort) : [];
     const stats = {
       scannedDocs: 0,
@@ -364,7 +387,7 @@ class JsonFileDatabase implements Database {
         let skipped = 0;
         for await (const doc of docsToScan) {
           stats.scannedDocs += 1;
-          if (!matchesFilter(doc, filter)) {
+          if (!matchesFilter(doc, filter, schema, this.options.customTypes)) {
             continue;
           }
           stats.matchedDocs += 1;
@@ -375,18 +398,26 @@ class JsonFileDatabase implements Database {
           if (yielded >= limit) {
             break;
           }
-          yield `${JSON.stringify(projectDocument(doc, projection))}\n`;
+          yield `${JSON.stringify(
+            projectDocument(doc, projection, schema, this.options.customTypes)
+          )}\n`;
           yielded += 1;
           stats.yieldedDocs = yielded;
         }
       } else {
         const maxResults = Number.isFinite(limit) ? limit + skip : Infinity;
         const compare = (left: Document, right: Document) =>
-          compareDocuments(left, right, sort as Record<string, 1 | -1>);
+          compareDocuments(
+            left,
+            right,
+            sort as Record<string, 1 | -1>,
+            schema,
+            this.options.customTypes
+          );
         const buffer: Document[] = [];
         for await (const doc of docsToScan) {
           stats.scannedDocs += 1;
-          if (!matchesFilter(doc, filter)) {
+          if (!matchesFilter(doc, filter, schema, this.options.customTypes)) {
             continue;
           }
           stats.matchedDocs += 1;
@@ -401,7 +432,9 @@ class JsonFileDatabase implements Database {
         const finalBuffer = buffer.slice(start, Math.min(end, buffer.length));
         stats.yieldedDocs = finalBuffer.length;
         for (const doc of finalBuffer) {
-          yield `${JSON.stringify(projectDocument(doc, projection))}\n`;
+          yield `${JSON.stringify(
+            projectDocument(doc, projection, schema, this.options.customTypes)
+          )}\n`;
         }
       }
     } finally {
@@ -522,14 +555,15 @@ class JsonFileDatabase implements Database {
     doc: Document,
     relations: JoinRelations
   ): Promise<Document> {
+    const baseSchema = await this.getCollectionSchema(collection);
     if (!relations || Object.keys(relations).length === 0) {
-      return cloneDocument(doc);
+      return projectDocument(cloneDocument(doc), undefined, baseSchema, this.options.customTypes);
     }
 
     const base = cloneDocument(doc);
     const normalized = normalizeJoinRelations(base, relations);
     if (normalized.length === 0) {
-      return base;
+      return projectDocument(base, undefined, baseSchema, this.options.customTypes);
     }
 
     const fetchPlan = new Map<
@@ -555,8 +589,13 @@ class JsonFileDatabase implements Database {
     });
 
     const fetched = new Map<string, Map<DocumentId, Document | null>>();
+    const foreignSchemas = new Map<string, CollectionSchema | null>();
     for (const plan of fetchPlan.values()) {
       const key = serializeJoinKey(plan.collection, plan.field);
+      if (!foreignSchemas.has(plan.collection)) {
+        const schema = await this.getCollectionSchema(plan.collection);
+        foreignSchemas.set(plan.collection, schema);
+      }
       fetched.set(
         key,
         await this.fetchJoinTargets(plan.collection, plan.field, plan.values)
@@ -566,11 +605,16 @@ class JsonFileDatabase implements Database {
     for (const entry of normalized) {
       const key = serializeJoinKey(entry.relation.foreignCollection, entry.relation.foreignField);
       const lookup = fetched.get(key) ?? new Map<DocumentId, Document | null>();
-      const projected = resolveProjection(entry, lookup);
+      const projected = resolveProjection(
+        entry,
+        lookup,
+        foreignSchemas.get(entry.relation.foreignCollection) ?? null,
+        this.options.customTypes
+      );
       setValueAtPath(base as Record<string, unknown>, entry.targetPath, projected);
     }
 
-    return base;
+    return projectDocument(base, undefined, baseSchema, this.options.customTypes);
   }
 
   async compact(collection: string): Promise<void> {
@@ -1047,7 +1091,7 @@ class JsonFileDatabase implements Database {
       ? applyDefaultsToDocument(cloned, schema)
       : cloned;
 
-    validateDocumentAgainstSchema(withDefaults, schema);
+    validateDocumentAgainstSchema(withDefaults, schema, this.options.customTypes);
     return withDefaults;
   }
 
@@ -1445,6 +1489,7 @@ function resolveOptions(options: DatabaseOptions): ResolvedOptions {
   const indexDir = options.indexDir ?? path.join(dataDir, 'indexes');
   const logDir = options.logDir ?? path.join(dataDir, 'logs');
   const tokenizer = resolveTokenizer(options.tokenizer);
+  const customTypes = createDefaultCustomTypes(options.customTypes ?? {});
   return {
     ...options,
     dataDir,
@@ -1452,6 +1497,7 @@ function resolveOptions(options: DatabaseOptions): ResolvedOptions {
     logDir,
     indexDir,
     tokenizer,
+    customTypes,
     schemas: options.schemas ?? {},
     log: options.log ?? createFileLogger(logDir),
     autoCompact: options.autoCompact ?? true,
@@ -1538,13 +1584,17 @@ function normalizeJoinRelations(
 
 function resolveProjection(
   entry: NormalizedJoin,
-  lookup: Map<DocumentId, Document | null>
+  lookup: Map<DocumentId, Document | null>,
+  schema: CollectionSchema | null,
+  customTypes: CustomTypeRegistry
 ): Document | Document[] | null {
   if (entry.isMany) {
     const resolved = entry.values
       .map((value) => lookup.get(value))
       .filter((value): value is Document => !!value)
-      .map((value) => projectDocument(value, entry.relation.projection));
+      .map((value) =>
+        projectDocument(value, entry.relation.projection, schema, customTypes)
+      );
     return resolved;
   }
 
@@ -1553,7 +1603,9 @@ function resolveProjection(
     return null;
   }
   const found = lookup.get(value);
-  return found ? projectDocument(found, entry.relation.projection) : null;
+  return found
+    ? projectDocument(found, entry.relation.projection, schema, customTypes)
+    : null;
 }
 
 function extractJoinValues(
@@ -1589,31 +1641,127 @@ function isJoinCacheEntryExpired(entry: JoinCacheEntry): boolean {
 
 function projectDocument(
   doc: Document,
-  projection?: string[]
+  projection?: string[],
+  schema?: CollectionSchema | null,
+  customTypes: CustomTypeRegistry = {}
 ): Document {
-  if (!projection || projection.length === 0) {
-    return cloneDocument(doc);
-  }
-
   const projected: Document = {};
+  const includeAll = !projection || projection.length === 0;
+  const source = doc as Record<string, unknown>;
+  const effectiveSchema = schema ?? null;
+
   if (doc._id !== undefined) {
     projected._id = doc._id;
   }
 
-  const source = doc as Record<string, unknown>;
+  if (doc._binRefs !== undefined && includeAll) {
+    projected._binRefs = cloneDocument(doc._binRefs);
+  }
+
+  if (includeAll) {
+    Object.keys(source).forEach((key) => {
+      if (key === '_id' || key === '_binRefs') {
+        return;
+      }
+      const value = source[key];
+      if (value === undefined) {
+        return;
+      }
+      const fieldSchema = effectiveSchema ? effectiveSchema.fields[key] ?? null : null;
+      const projectedValue = projectValueWithSchema(
+        value,
+        fieldSchema,
+        customTypes,
+        key
+      );
+      if (projectedValue !== undefined) {
+        (projected as Record<string, unknown>)[key] = projectedValue as unknown;
+      }
+    });
+    return projected;
+  }
+
   projection.forEach((fieldPath) => {
     const value = getValueAtPath(source, fieldPath);
     if (value === undefined) {
       return;
     }
-    setValueAtPath(
-      projected as Record<string, unknown>,
-      fieldPath,
-      cloneDocument(value) as unknown
+    const fieldSchema = resolveFieldSchemaForPath(effectiveSchema, fieldPath);
+    const projectedValue = projectValueWithSchema(
+      value,
+      fieldSchema,
+      customTypes,
+      fieldPath
     );
+    if (projectedValue === undefined) {
+      return;
+    }
+
+    setValueAtPath(projected as Record<string, unknown>, fieldPath, projectedValue);
   });
 
   return projected;
+}
+
+function projectValueWithSchema(
+  value: unknown,
+  schema: FieldSchema | null,
+  customTypes: CustomTypeRegistry,
+  fieldPath = ''
+): unknown {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!schema) {
+    return cloneDocument(value) as unknown;
+  }
+
+  if (schema.type === 'custom') {
+    const definition = getCustomTypeDefinition(
+      customTypes,
+      schema.customType,
+      fieldPath || schema.customType
+    );
+    const projected = definition.project
+      ? definition.project(value as unknown, schema.options)
+      : (value as unknown);
+    return cloneDocument(projected) as unknown;
+  }
+
+  if (schema.type === 'object') {
+    if (!isPlainObject(value)) {
+      return cloneDocument(value) as unknown;
+    }
+    const result: Record<string, unknown> = {};
+    Object.entries(value as Record<string, unknown>).forEach(([key, child]) => {
+      const childSchema = schema.fields[key];
+      if (!childSchema) {
+        return;
+      }
+      const projectedChild = projectValueWithSchema(
+        child,
+        childSchema,
+        customTypes,
+        fieldPath ? `${fieldPath}.${key}` : key
+      );
+      if (projectedChild !== undefined) {
+        result[key] = projectedChild as unknown;
+      }
+    });
+    return result;
+  }
+
+  if (schema.type === 'array') {
+    if (!Array.isArray(value)) {
+      return cloneDocument(value) as unknown;
+    }
+    return (value as unknown[]).map((item) =>
+      projectValueWithSchema(item, schema.items, customTypes, fieldPath)
+    );
+  }
+
+  return cloneDocument(value) as unknown;
 }
 
 function getValueAtPath(
@@ -2011,7 +2159,8 @@ function applyDefaultsToValue(value: unknown, schema: FieldSchema): unknown {
 
 function validateDocumentAgainstSchema(
   doc: Document,
-  schema: CollectionSchema
+  schema: CollectionSchema,
+  customTypes: CustomTypeRegistry
 ): void {
   const record = doc as Record<string, unknown>;
   Object.keys(record).forEach((key) => {
@@ -2025,16 +2174,28 @@ function validateDocumentAgainstSchema(
 
   Object.entries(schema.fields).forEach(([field, definition]) => {
     const value = record[field];
-    validateField(`${field}`, value, definition);
+    const normalized = validateField(`${field}`, value, definition, customTypes);
+    if (normalized !== value) {
+      if (normalized === undefined) {
+        delete record[field];
+      } else {
+        record[field] = normalized as unknown;
+      }
+    }
   });
 }
 
-function validateField(pathname: string, value: unknown, schema: FieldSchema): void {
+function validateField(
+  pathname: string,
+  value: unknown,
+  schema: FieldSchema,
+  customTypes: CustomTypeRegistry
+): unknown {
   if (value === undefined) {
     if (schema.required) {
       throw new Error(`Field '${pathname}' is required`);
     }
-    return;
+    return value;
   }
 
   switch (schema.type) {
@@ -2061,7 +2222,7 @@ function validateField(pathname: string, value: unknown, schema: FieldSchema): v
           `Field '${pathname}' must be one of: ${schema.enum.join(', ')}`
         );
       }
-      break;
+      return value;
     case 'number':
       assertNumber(pathname, value);
       if (schema.min !== undefined && (value as number) < schema.min) {
@@ -2073,12 +2234,12 @@ function validateField(pathname: string, value: unknown, schema: FieldSchema): v
       if (schema.integer && !Number.isInteger(value as number)) {
         throw new Error(`Field '${pathname}' must be an integer`);
       }
-      break;
+      return value;
     case 'boolean':
       if (typeof value !== 'boolean') {
         throw new Error(`Field '${pathname}' must be a boolean`);
       }
-      break;
+      return value;
     case 'date':
       if (
         !(typeof value === 'string' || value instanceof Date) ||
@@ -2086,13 +2247,17 @@ function validateField(pathname: string, value: unknown, schema: FieldSchema): v
       ) {
         throw new Error(`Field '${pathname}' must be a valid date/ISO string`);
       }
-      break;
+      return value;
     case 'object':
       if (!isPlainObject(value)) {
         throw new Error(`Field '${pathname}' must be an object`);
       }
-      validateNestedObject(pathname, value as Record<string, unknown>, schema.fields);
-      break;
+      return validateNestedObject(
+        pathname,
+        value as Record<string, unknown>,
+        schema.fields,
+        customTypes
+      );
     case 'array':
       if (!Array.isArray(value)) {
         throw new Error(`Field '${pathname}' must be an array`);
@@ -2107,13 +2272,21 @@ function validateField(pathname: string, value: unknown, schema: FieldSchema): v
           `Field '${pathname}' must have at most ${schema.maxItems} items`
         );
       }
-      value.forEach((item, idx) => {
-        validateField(`${pathname}[${idx}]`, item, schema.items);
-      });
-      break;
+      return value.map((item, idx) =>
+        validateField(`${pathname}[${idx}]`, item, schema.items, customTypes)
+      );
     case 'json':
       // json accepts any value
-      break;
+      return value;
+    case 'custom': {
+      const definition = getCustomTypeDefinition(
+        customTypes,
+        schema.customType,
+        pathname
+      );
+      const normalized = definition.fromInput(value, schema.options);
+      return normalized;
+    }
     default:
       throw new Error(`Field '${pathname}' has unsupported schema type`);
   }
@@ -2122,18 +2295,31 @@ function validateField(pathname: string, value: unknown, schema: FieldSchema): v
 function validateNestedObject(
   pathname: string,
   value: Record<string, unknown>,
-  fields: Record<string, FieldSchema>
-): void {
+  fields: Record<string, FieldSchema>,
+  customTypes: CustomTypeRegistry
+): Record<string, unknown> {
   Object.keys(value).forEach((key) => {
     if (!fields[key]) {
       throw new Error(`Unexpected field '${pathname}.${key}' not defined in schema`);
     }
   });
 
+  const normalized: Record<string, unknown> = {};
+
   Object.entries(fields).forEach(([key, definition]) => {
     const childValue = value[key];
-    validateField(`${pathname}.${key}`, childValue, definition);
+    const coerced = validateField(
+      `${pathname}.${key}`,
+      childValue,
+      definition,
+      customTypes
+    );
+    if (coerced !== undefined) {
+      normalized[key] = coerced as unknown;
+    }
   });
+
+  return normalized;
 }
 
 function assertString(pathname: string, value: unknown): void {
@@ -2599,24 +2785,29 @@ async function readLog(
   }
 }
 
-function matchesFilter(doc: Document, filter: Filter): boolean {
+function matchesFilter(
+  doc: Document,
+  filter: Filter,
+  schema: CollectionSchema | null,
+  customTypes: CustomTypeRegistry
+): boolean {
   if (!filter || Object.keys(filter).length === 0) {
     return true;
   }
 
   if (Array.isArray(filter.$and)) {
-    if (!filter.$and.every((sub) => matchesFilter(doc, sub))) {
+    if (!filter.$and.every((sub) => matchesFilter(doc, sub, schema, customTypes))) {
       return false;
     }
   }
 
   if (Array.isArray(filter.$or)) {
-    if (!filter.$or.some((sub) => matchesFilter(doc, sub))) {
+    if (!filter.$or.some((sub) => matchesFilter(doc, sub, schema, customTypes))) {
       return false;
     }
   }
 
-  if (filter.$not && matchesFilter(doc, filter.$not)) {
+  if (filter.$not && matchesFilter(doc, filter.$not, schema, customTypes)) {
     return false;
   }
 
@@ -2626,7 +2817,8 @@ function matchesFilter(doc: Document, filter: Filter): boolean {
     }
 
     const value = getValueAtPath(doc, key);
-    if (!matchesFieldPredicate(value, predicate)) {
+    const fieldSchema = resolveFieldSchemaForPath(schema, key);
+    if (!matchesFieldPredicate(value, predicate, fieldSchema, customTypes, key)) {
       return false;
     }
   }
@@ -2634,19 +2826,198 @@ function matchesFilter(doc: Document, filter: Filter): boolean {
   return true;
 }
 
-function matchesFieldPredicate(value: unknown, predicate: unknown): boolean {
+function resolveFieldSchemaForPath(
+  schema: CollectionSchema | null,
+  path: string
+): FieldSchema | null {
+  if (!schema || !path) {
+    return null;
+  }
+
+  const segments = path.split('.');
+  let current: FieldSchema | null = schema.fields[segments[0] as string] ?? null;
+
+  for (let idx = 1; idx < segments.length && current; idx += 1) {
+    const segment = segments[idx] as string;
+    if (current.type === 'object') {
+      current = current.fields[segment] ?? null;
+      continue;
+    }
+
+    if (current.type === 'array') {
+      current = current.items;
+      if (current.type === 'object') {
+        current = current.fields[segment] ?? null;
+      }
+      continue;
+    }
+
+    current = null;
+  }
+
+  return current;
+}
+
+function normalizePredicateInput(
+  input: unknown,
+  schema: FieldSchema | null,
+  customTypes: CustomTypeRegistry,
+  fieldPath: string
+): unknown {
+  if (input === undefined) {
+    return input;
+  }
+
+  if (!schema) {
+    return input;
+  }
+
+  if (schema.type === 'custom') {
+    const definition = getCustomTypeDefinition(customTypes, schema.customType, fieldPath);
+    return definition.fromInput(input, schema.options);
+  }
+
+  if (schema.type === 'date') {
+    if (input instanceof Date) {
+      return input;
+    }
+    if (typeof input === 'string' || typeof input === 'number') {
+      const parsed = new Date(input as string | number);
+      return Number.isNaN(parsed.getTime()) ? input : parsed;
+    }
+  }
+
+  return input;
+}
+
+function resolveComparator(
+  schema: FieldSchema | null,
+  customTypes: CustomTypeRegistry,
+  fieldPath: string
+): (left: unknown, right: unknown) => number | null {
+  if (!schema) {
+    return (left: unknown, right: unknown) => compareValues(left, right);
+  }
+
+  if (schema.type === 'custom') {
+    const definition = getCustomTypeDefinition(customTypes, schema.customType, fieldPath);
+    return (left: unknown, right: unknown) => {
+      const leftComparable = normalizeComparableForField(
+        left,
+        schema,
+        customTypes,
+        fieldPath
+      );
+      const rightComparable = normalizeComparableForField(
+        right,
+        schema,
+        customTypes,
+        fieldPath
+      );
+      if (leftComparable === null || rightComparable === null) {
+        return null;
+      }
+      if (definition.compare) {
+        return definition.compare(leftComparable, rightComparable, schema.options);
+      }
+      return compareValues(leftComparable, rightComparable);
+    };
+  }
+
+  return (left: unknown, right: unknown) =>
+    compareValues(
+      normalizeComparableForField(left, schema, customTypes, fieldPath),
+      normalizeComparableForField(right, schema, customTypes, fieldPath)
+    );
+}
+
+function normalizeComparableForField(
+  value: unknown,
+  schema: FieldSchema | null,
+  customTypes: CustomTypeRegistry,
+  fieldPath: string
+): ComparableValue | null {
+  if (value === undefined) {
+    return null;
+  }
+
+  if (!schema) {
+    const normalized = normalizeComparable(value);
+    return normalized === undefined ? null : normalized;
+  }
+
+  if (schema.type === 'custom') {
+    const definition = getCustomTypeDefinition(customTypes, schema.customType, fieldPath);
+    const comparable = definition.toComparable
+      ? definition.toComparable(value as unknown, schema.options)
+      : (value as ComparableValue);
+    return isComparableValue(comparable) ? comparable : null;
+  }
+
+  if (schema.type === 'date') {
+    if (value instanceof Date) {
+      return value;
+    }
+    if (typeof value === 'string' || typeof value === 'number') {
+      const parsed = new Date(value as string | number);
+      return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+    return null;
+  }
+
+  const normalized = normalizeComparable(value);
+  return normalized === undefined ? null : normalized;
+}
+
+function isComparableValue(value: unknown): value is ComparableValue {
+  return (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    value === null ||
+    value instanceof Date
+  );
+}
+
+function getCustomTypeDefinition(
+  registry: CustomTypeRegistry,
+  name: string,
+  fieldPath: string
+): CustomTypeDefinition<unknown, unknown> {
+  const definition = registry[name];
+  if (!definition) {
+    throw new Error(`Unknown custom type '${name}' referenced by '${fieldPath}'`);
+  }
+  return definition;
+}
+
+function matchesFieldPredicate(
+  value: unknown,
+  predicate: unknown,
+  schema: FieldSchema | null,
+  customTypes: CustomTypeRegistry,
+  fieldPath: string
+): boolean {
+  const comparator = resolveComparator(schema, customTypes, fieldPath);
+  const normalizePredicateValue = (input: unknown) =>
+    normalizePredicateInput(input, schema, customTypes, fieldPath);
+  const equals = (left: unknown, right: unknown) =>
+    areValuesEqual(left, right, comparator);
+  const compare = (left: unknown, right: unknown, op: 'gt' | 'gte' | 'lt' | 'lte') =>
+    compareWithOperator(left, right, op, comparator);
+
   if (predicate === undefined) {
     return true;
   }
 
   if (Array.isArray(predicate)) {
-    return predicate.some((expected) => valuesEqual(value, expected));
+    return predicate.some((expected) => equals(value, normalizePredicateValue(expected)));
   }
 
   if (isPlainObject(predicate)) {
     const ops = predicate as Record<string, unknown>;
 
-    if (ops.$not !== undefined && matchesFieldPredicate(value, ops.$not)) {
+    if (ops.$not !== undefined && matchesFieldPredicate(value, ops.$not, schema, customTypes, fieldPath)) {
       return false;
     }
 
@@ -2664,27 +3035,27 @@ function matchesFieldPredicate(value: unknown, predicate: unknown): boolean {
       }
     }
 
-    if (ops.$eq !== undefined && !valuesEqual(value, ops.$eq)) {
+    if (ops.$eq !== undefined && !equals(value, normalizePredicateValue(ops.$eq))) {
       return false;
     }
 
-    if (ops.$ne !== undefined && valuesEqual(value, ops.$ne)) {
+    if (ops.$ne !== undefined && equals(value, normalizePredicateValue(ops.$ne))) {
       return false;
     }
 
-    if (ops.$gt !== undefined && !compareWithOperator(value, ops.$gt, 'gt')) {
+    if (ops.$gt !== undefined && !compare(value, normalizePredicateValue(ops.$gt), 'gt')) {
       return false;
     }
 
-    if (ops.$gte !== undefined && !compareWithOperator(value, ops.$gte, 'gte')) {
+    if (ops.$gte !== undefined && !compare(value, normalizePredicateValue(ops.$gte), 'gte')) {
       return false;
     }
 
-    if (ops.$lt !== undefined && !compareWithOperator(value, ops.$lt, 'lt')) {
+    if (ops.$lt !== undefined && !compare(value, normalizePredicateValue(ops.$lt), 'lt')) {
       return false;
     }
 
-    if (ops.$lte !== undefined && !compareWithOperator(value, ops.$lte, 'lte')) {
+    if (ops.$lte !== undefined && !compare(value, normalizePredicateValue(ops.$lte), 'lte')) {
       return false;
     }
 
@@ -2693,8 +3064,8 @@ function matchesFieldPredicate(value: unknown, predicate: unknown): boolean {
       if (
         !Array.isArray(range) ||
         range.length !== 2 ||
-        !compareWithOperator(value, range[0], 'gte') ||
-        !compareWithOperator(value, range[1], 'lte')
+        !compare(value, normalizePredicateValue(range[0]), 'gte') ||
+        !compare(value, normalizePredicateValue(range[1]), 'lte')
       ) {
         return false;
       }
@@ -2703,7 +3074,7 @@ function matchesFieldPredicate(value: unknown, predicate: unknown): boolean {
     if (ops.$in !== undefined) {
       if (
         !Array.isArray(ops.$in) ||
-        !ops.$in.some((candidate) => valuesEqual(value, candidate))
+        !ops.$in.some((candidate) => equals(value, normalizePredicateValue(candidate)))
       ) {
         return false;
       }
@@ -2712,7 +3083,7 @@ function matchesFieldPredicate(value: unknown, predicate: unknown): boolean {
     if (ops.$nin !== undefined) {
       if (
         Array.isArray(ops.$nin) &&
-        ops.$nin.some((candidate) => valuesEqual(value, candidate))
+        ops.$nin.some((candidate) => equals(value, normalizePredicateValue(candidate)))
       ) {
         return false;
       }
@@ -2733,7 +3104,7 @@ function matchesFieldPredicate(value: unknown, predicate: unknown): boolean {
     return true;
   }
 
-  return valuesEqual(value, predicate);
+  return equals(value, normalizePredicateValue(predicate));
 }
 
 function matchesLike(value: unknown, pattern: unknown, caseInsensitive: boolean): boolean {
@@ -2751,12 +3122,32 @@ function createLikeRegex(pattern: string, caseInsensitive: boolean): RegExp {
   return new RegExp(`^${regexBody}$`, caseInsensitive ? 'i' : undefined);
 }
 
+function areValuesEqual(
+  left: unknown,
+  right: unknown,
+  comparator?: (left: unknown, right: unknown) => number | null
+): boolean {
+  if (comparator) {
+    const comparison = comparator(left, right);
+    if (comparison !== null) {
+      return comparison === 0;
+    }
+  }
+
+  if (left instanceof Date && right instanceof Date) {
+    return left.getTime() === right.getTime();
+  }
+
+  return Object.is(left, right);
+}
+
 function compareWithOperator(
   value: unknown,
   expected: unknown,
-  op: 'gt' | 'gte' | 'lt' | 'lte'
+  op: 'gt' | 'gte' | 'lt' | 'lte',
+  comparator?: (left: unknown, right: unknown) => number | null
 ): boolean {
-  const compare = compareValues(value, expected);
+  const compare = comparator ? comparator(value, expected) : compareValues(value, expected);
   if (compare === null) {
     return false;
   }
@@ -2816,14 +3207,6 @@ function normalizeComparable(value: unknown): string | number | boolean | null |
   }
 
   return undefined;
-}
-
-function valuesEqual(left: unknown, right: unknown): boolean {
-  if (left instanceof Date && right instanceof Date) {
-    return left.getTime() === right.getTime();
-  }
-
-  return Object.is(left, right);
 }
 
 function extractIndexableFieldPredicates(
@@ -2895,7 +3278,9 @@ function normalizeRowNumberOptions(
 function groupDocuments(
   docs: Document[],
   groupBy: string[],
-  aggregates?: Record<string, AggregateDefinition>
+  aggregates?: Record<string, AggregateDefinition>,
+  schema?: CollectionSchema | null,
+  customTypes?: CustomTypeRegistry
 ): Document[] {
   const aggregateDefs = normalizeAggregates(aggregates);
   const groupKeyFields = Array.isArray(groupBy) ? groupBy : [];
@@ -2905,8 +3290,15 @@ function groupDocuments(
     const keyValues: Record<string, unknown> = {};
     groupKeyFields.forEach((field) => {
       const value = getValueAtPath(doc as Record<string, unknown>, field);
+      const fieldSchema = resolveFieldSchemaForPath(schema ?? null, field);
+      const projected = projectValueWithSchema(
+        value,
+        fieldSchema,
+        customTypes ?? {},
+        field
+      );
       if (value !== undefined) {
-        keyValues[field] = cloneDocument(value) as unknown;
+        keyValues[field] = projected as unknown;
       }
     });
     const key = serializeKeyForFields(keyValues, groupKeyFields);
@@ -2924,7 +3316,12 @@ function groupDocuments(
 
   const results: Document[] = [];
   buckets.forEach(({ keys, rows }) => {
-    const aggregatesForGroup = computeAggregates(rows, aggregateDefs);
+    const aggregatesForGroup = computeAggregates(
+      rows,
+      aggregateDefs,
+      schema,
+      customTypes ?? {}
+    );
     results.push({ ...keys, ...aggregatesForGroup });
   });
 
@@ -2956,7 +3353,9 @@ function normalizeAggregates(
 
 function computeAggregates(
   rows: Document[],
-  aggregates: Record<string, AggregateDefinition>
+  aggregates: Record<string, AggregateDefinition>,
+  schema?: CollectionSchema | null,
+  customTypes: CustomTypeRegistry = {}
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
 
@@ -2966,23 +3365,45 @@ function computeAggregates(
         result[alias] = rows.length;
         break;
       case 'sum': {
-        const numbers = extractNumericValues(rows, spec.field as string);
+        const numbers = extractNumericValues(
+          rows,
+          spec.field as string,
+          schema,
+          customTypes
+        );
         const sum = numbers.reduce((acc, value) => acc + value, 0);
         result[alias] = sum;
         break;
       }
       case 'avg': {
-        const numbers = extractNumericValues(rows, spec.field as string);
+        const numbers = extractNumericValues(
+          rows,
+          spec.field as string,
+          schema,
+          customTypes
+        );
         const sum = numbers.reduce((acc, value) => acc + value, 0);
         result[alias] = numbers.length > 0 ? sum / numbers.length : null;
         break;
       }
       case 'min': {
-        result[alias] = extractExtremum(rows, spec.field as string, 'min');
+        result[alias] = extractExtremum(
+          rows,
+          spec.field as string,
+          'min',
+          schema,
+          customTypes
+        );
         break;
       }
       case 'max': {
-        result[alias] = extractExtremum(rows, spec.field as string, 'max');
+        result[alias] = extractExtremum(
+          rows,
+          spec.field as string,
+          'max',
+          schema,
+          customTypes
+        );
         break;
       }
       default:
@@ -2993,36 +3414,56 @@ function computeAggregates(
   return result;
 }
 
-function extractNumericValues(rows: Document[], field: string): number[] {
+function extractNumericValues(
+  rows: Document[],
+  field: string,
+  schema?: CollectionSchema | null,
+  customTypes: CustomTypeRegistry = {}
+): number[] {
+  const fieldSchema = resolveFieldSchemaForPath(schema ?? null, field);
   return rows
-    .map((row) => getValueAtPath(row as Record<string, unknown>, field))
-    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+    .map((row) => {
+      const value = getValueAtPath(row as Record<string, unknown>, field);
+      const projected = projectValueWithSchema(value, fieldSchema, customTypes, field);
+      return projected;
+    })
+    .filter(
+      (value): value is number =>
+        typeof value === 'number' && Number.isFinite(value as number)
+    );
 }
 
 function extractExtremum(
   rows: Document[],
   field: string,
-  mode: 'min' | 'max'
+  mode: 'min' | 'max',
+  schema?: CollectionSchema | null,
+  customTypes: CustomTypeRegistry = {}
 ): unknown {
+  const fieldSchema = resolveFieldSchemaForPath(schema ?? null, field);
+  const comparator = resolveComparator(fieldSchema, customTypes, field);
   let best: unknown;
   rows.forEach((row) => {
-    const value = getValueAtPath(row as Record<string, unknown>, field);
-    if (!isComparableAggregateValue(value)) {
+    const rawValue = getValueAtPath(row as Record<string, unknown>, field);
+    const projected = projectValueWithSchema(rawValue, fieldSchema, customTypes, field);
+    if (!isComparableAggregateValue(projected)) {
       return;
     }
 
     if (best === undefined) {
-      best = value;
+      best = projected;
       return;
     }
 
-    const comparison = compareValues(value, best);
+    const comparison = comparator
+      ? comparator(projected, best)
+      : compareValues(projected, best);
     if (comparison === null) {
       return;
     }
 
     if ((mode === 'min' && comparison < 0) || (mode === 'max' && comparison > 0)) {
-      best = value;
+      best = projected;
     }
   });
 
@@ -3062,19 +3503,23 @@ function applyRowNumber(
   docs: Document[],
   partitionBy: string[],
   sort: Record<string, 1 | -1> | undefined,
-  options: RowNumberOptions
+  options: RowNumberOptions,
+  schema: CollectionSchema | null,
+  customTypes: CustomTypeRegistry
 ): Document[] {
   const as = options.as && options.as.trim().length > 0 ? options.as : '_rowNumber';
   const partitionFields = Array.isArray(partitionBy) && partitionBy.length > 0 ? partitionBy : [];
   const orderForNumbering = options.orderBy ?? sort;
   const orderedDocs =
     orderForNumbering && docs.length > 1
-      ? [...docs].sort((left, right) => compareDocuments(left, right, orderForNumbering))
+      ? [...docs].sort((left, right) =>
+          compareDocuments(left, right, orderForNumbering, schema, customTypes)
+        )
       : [...docs];
 
   const counters = new Map<string, number>();
   const numbered = orderedDocs.map((doc) => {
-    const key = serializePartitionKey(doc, partitionFields);
+    const key = serializePartitionKey(doc, partitionFields, schema, customTypes);
     const next = (counters.get(key) ?? 0) + 1;
     counters.set(key, next);
     const clone = cloneDocument(doc);
@@ -3083,24 +3528,35 @@ function applyRowNumber(
   });
 
   if (sort && orderForNumbering && !sortOrdersEqual(sort, orderForNumbering)) {
-    return numbered.sort((left, right) => compareDocuments(left, right, sort));
+    return numbered.sort((left, right) =>
+      compareDocuments(left, right, sort, schema, customTypes)
+    );
   }
 
   if (sort && !orderForNumbering) {
-    return numbered.sort((left, right) => compareDocuments(left, right, sort));
+    return numbered.sort((left, right) =>
+      compareDocuments(left, right, sort, schema, customTypes)
+    );
   }
 
   return numbered;
 }
 
-function serializePartitionKey(doc: Document, fields: string[]): string {
+function serializePartitionKey(
+  doc: Document,
+  fields: string[],
+  schema: CollectionSchema | null,
+  customTypes: CustomTypeRegistry
+): string {
   if (fields.length === 0) {
     return '__all__';
   }
 
   const values = fields.map((field) => {
     const value = getValueAtPath(doc as Record<string, unknown>, field);
-    return `${field}:${JSON.stringify(value)}`;
+    const fieldSchema = resolveFieldSchemaForPath(schema, field);
+    const projected = projectValueWithSchema(value, fieldSchema, customTypes, field);
+    return `${field}:${JSON.stringify(projected)}`;
   });
   return values.join('|');
 }
@@ -3125,22 +3581,22 @@ function sortOrdersEqual(
 function compareDocuments(
   left: Document,
   right: Document,
-  sort: Record<string, 1 | -1>
+  sort: Record<string, 1 | -1>,
+  schema?: CollectionSchema | null,
+  customTypes?: CustomTypeRegistry
 ): number {
+  const registry = customTypes ?? {};
+  const collectionSchema = schema ?? null;
+
   for (const key of Object.keys(sort)) {
     const direction = sort[key];
-    const a = (left as Record<string, unknown>)[key] as
-      | string
-      | number
-      | boolean
-      | null
-      | undefined;
-    const b = (right as Record<string, unknown>)[key] as
-      | string
-      | number
-      | boolean
-      | null
-      | undefined;
+    const comparator = resolveComparator(
+      collectionSchema ? resolveFieldSchemaForPath(collectionSchema, key) : null,
+      registry,
+      key
+    );
+    const a = getValueAtPath(left as Record<string, unknown>, key);
+    const b = getValueAtPath(right as Record<string, unknown>, key);
 
     if (a === b) {
       continue;
@@ -3154,12 +3610,9 @@ function compareDocuments(
       return direction === 1 ? 1 : -1;
     }
 
-    if (a > b) {
-      return direction === 1 ? 1 : -1;
-    }
-
-    if (a < b) {
-      return direction === 1 ? -1 : 1;
+    const comparison = comparator ? comparator(a, b) : compareValues(a, b);
+    if (comparison !== null && comparison !== 0) {
+      return direction === 1 ? comparison : -comparison;
     }
   }
 
@@ -3241,3 +3694,4 @@ export function createDatabase(options: DatabaseOptions = {}): Database {
 }
 
 export * from './types.js';
+export { createDefaultCustomTypes, normalizeDecimalString, compareDecimalStrings } from './customTypes.js';

@@ -60,6 +60,14 @@ await db.find('users', {}, {
 - Uniqueness: single or composite unique constraints enforced via indexes and manifest metadata.
 - Validation runs on insert/update; compaction re-validates and flags corrupt rows.
 
+## Custom Types
+
+- Built-in custom types: `int`, `float`, `decimal`, and `varchar` (string with `maxLength` option); reference them with `type: 'custom'`.
+- Custom types normalize inputs (`fromInput`), expose comparison hooks (`toComparable`/`compare`) for filtering/sorting, and can project stored values differently.
+- Decimals are stored as canonical strings, ordered with a decimal-safe comparator, and projected as numbers by default (use strings for high precision).
+- Custom types merge into the default registry via `customTypes` when you call `createDatabase`.
+- See `docs/custom-types.md` for the lifecycle, built-in behavior, and how to add your own types.
+
 ## Data & Query Behavior
 
 - Writes append to log; optional fsync per write or batched.
