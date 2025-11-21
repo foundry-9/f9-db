@@ -1,10 +1,11 @@
-import fs from 'node:fs';
-import { promises as fsp } from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
 import { afterEach, describe, expect, jest, test } from '@jest/globals';
 import { createDatabase } from '../src/index.js';
 import type { Database } from '../src/types.js';
+
+const fsp = fs.promises;
 
 function createTempDirs(): { dataDir: string; binaryDir: string; logDir: string } {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'f9-db-data-'));
@@ -54,6 +55,50 @@ describe('JsonFileDatabase', () => {
       age: 41,
       city: 'Paris'
     });
+  });
+
+  test('updateWhere applies filters to update matching docs', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    await db.insert('orders', { status: 'pending', total: 10 });
+    await db.insert('orders', { status: 'pending', total: 20 });
+    await db.insert('orders', { status: 'done', total: 5 });
+
+    const updated = await db.updateWhere('orders', { status: 'complete' }, { status: 'pending' });
+    expect(updated).toHaveLength(2);
+    expect(updated.every((order) => order.status === 'complete')).toBe(true);
+
+    const all = await db.find('orders');
+    expect(all.map((order) => order.status).sort()).toEqual(['complete', 'complete', 'done']);
+  });
+
+  test('updateWhere can use sort/limit and mutation functions like SQL UPDATE', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    await db.insert('users', { name: 'Ada', city: 'London', score: 10 });
+    await db.insert('users', { name: 'Bob', city: 'London', score: 5 });
+    await db.insert('users', { name: 'Carol', city: 'Lisbon', score: 1 });
+
+    const updated = await db.updateWhere(
+      'users',
+      (user) => ({ score: (user.score as number) + 1, touched: true }),
+      { city: 'London' },
+      { sort: { score: 1 }, limit: 1 }
+    );
+
+    expect(updated.map((user) => user.name)).toEqual(['Bob']);
+    expect(updated[0]?.score).toBe(6);
+    expect(updated[0]?.touched).toBe(true);
+
+    const final = await db.find('users', {}, { sort: { name: 1 } });
+    expect(final.map((user) => ({ name: user.name, score: user.score, touched: user.touched })))
+      .toEqual([
+        { name: 'Ada', score: 10, touched: undefined },
+        { name: 'Bob', score: 6, touched: true },
+        { name: 'Carol', score: 1, touched: undefined }
+      ]);
   });
 
   test('remove deletes a document', async () => {
@@ -383,8 +428,7 @@ describe('JsonFileDatabase', () => {
 
     const logPath = path.join(dataDir, 'users.jsonl');
     const manifestPath = path.join(dataDir, 'manifest.json');
-    const rotatedFiles = fs
-      .readdirSync(dataDir)
+    const rotatedFiles = fs.readdirSync(dataDir)
       .filter((file) => file.startsWith('users.jsonl.') && file.endsWith('.bak'));
 
     expect(rotatedFiles.length).toBe(1);

@@ -181,6 +181,10 @@ export interface FindOptions {
   diagnostics?: (stats: StreamDiagnostics) => void;
 }
 
+export type UpdateMutation = Partial<Document> | ((doc: Document) => Partial<Document>);
+
+export type UpdateWhereOptions = Pick<FindOptions, 'limit' | 'skip' | 'sort'>;
+
 export type AggregateOperator = 'count' | 'sum' | 'avg' | 'min' | 'max';
 
 export interface AggregateDefinition {
@@ -312,8 +316,14 @@ export interface Database {
   update: (
     collection: string,
     id: DocumentId,
-    mutation: Partial<Document>
+    mutation: UpdateMutation
   ) => Promise<Document>;
+  updateWhere: (
+    collection: string,
+    mutation: UpdateMutation,
+    filter: Filter,
+    options?: UpdateWhereOptions
+  ) => Promise<Document[]>;
   remove: (collection: string, id: DocumentId) => Promise<void>;
   find: (
     collection: string,

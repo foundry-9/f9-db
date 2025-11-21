@@ -20,6 +20,7 @@ const db = createDatabase({ dataDir: './data', binaryDir: './binaries' });
 - `ROW_NUMBER() OVER (PARTITION BY ...)` → `partitionBy` + `rowNumber` on `find`
 - `JOIN` → fetch docs, then `db.join(collection, doc, relations)` to resolve foreign keys into nested objects/arrays
 - `CREATE INDEX` → `db.ensureIndex(collection, field, { unique?: true })`
+- `UPDATE ... SET ... WHERE ...` → `db.updateWhere('table', mutation|((doc) => mutation), filter, { sort?, limit?, skip? })` (use `update(id, patch)` when you already have the `_id`)
 
 ## Simple SELECT Examples
 
@@ -87,6 +88,47 @@ f9-db
 ```ts
 await db.find('users', { city: ['London', 'Lisbon'] });
 // equivalent: { city: { $in: ['London', 'Lisbon'] } }
+```
+
+## UPDATE Equivalents
+
+Use `updateWhere` to mirror SQL’s `UPDATE ... WHERE ...` semantics. It returns the updated docs (array). Pass a plain object for static patches or a function if the new values depend on the current row.
+
+**Basic UPDATE**
+
+SQL
+
+```sql
+UPDATE orders SET status = 'complete', reviewed_at = NOW() WHERE status = 'pending';
+```
+
+f9-db
+
+```ts
+await db.updateWhere('orders', {
+  status: 'complete',
+  reviewedAt: new Date().toISOString()
+}, { status: 'pending' });
+```
+
+**UPDATE with ORDER BY/LIMIT and computed values**
+
+SQL
+
+```sql
+UPDATE users SET score = score + 1 WHERE city = 'London' ORDER BY score ASC LIMIT 1;
+```
+
+f9-db
+
+```ts
+const [bumped] = await db.updateWhere(
+  'users',
+  (user) => ({ score: (user.score as number) + 1 }),
+  { city: 'London' },
+  { sort: { score: 1 }, limit: 1 }
+);
+// bumped contains the updated doc with the lowest previous score in London
 ```
 
 ## Aggregations and Windows

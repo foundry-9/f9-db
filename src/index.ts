@@ -1,6 +1,5 @@
 import path from 'node:path';
-import fs from 'node:fs';
-import { promises as fsp } from 'node:fs';
+import { promises as fsp, mkdirSync, createWriteStream, createReadStream } from 'node:fs';
 import crypto from 'node:crypto';
 import type {
   Database,
@@ -27,7 +26,9 @@ import type {
   RowNumberOptions,
   ComparableValue,
   CustomTypeRegistry,
-  CustomTypeDefinition
+  CustomTypeDefinition,
+  UpdateWhereOptions,
+  UpdateMutation
 } from './types.js';
 import { createDefaultCustomTypes } from './customTypes.js';
 
@@ -99,7 +100,7 @@ interface LockConfig {
 }
 
 class FileLock {
-  private handle: fs.promises.FileHandle | null = null;
+  private handle: fsp.FileHandle | null = null;
   private readonly path: string;
   private readonly retryMs: number;
   private readonly timeoutMs: number;
@@ -158,8 +159,8 @@ class FileLock {
 
 function createFileLogger(logDir: string): Logger {
   const logPath = path.join(logDir, 'app.log');
-  fs.mkdirSync(path.dirname(logPath), { recursive: true });
-  const stream = fs.createWriteStream(logPath, { flags: 'a' });
+  mkdirSync(path.dirname(logPath), { recursive: true });
+  const stream = createWriteStream(logPath, { flags: 'a' });
 
   const write = (level: string, msg: string, context?: Record<string, unknown>): void => {
     const payload: Record<string, unknown> = {
@@ -184,11 +185,11 @@ function createFileLogger(logDir: string): Logger {
 }
 
 class JsonFileDatabase implements Database {
-  private options: ResolvedOptions;
-  private collections = new Map<string, CollectionState>();
+  private readonly options: ResolvedOptions;
+  private readonly collections = new Map<string, CollectionState>();
   private manifest: Manifest | null = null;
-  private manifestPath: string;
-  private joinCache = new Map<
+  private readonly manifestPath: string;
+  private readonly joinCache = new Map<
     string,
     Map<string, Map<string, JoinCacheEntry>>
   >();
@@ -234,7 +235,7 @@ class JsonFileDatabase implements Database {
   async update(
     collection: string,
     id: DocumentId,
-    mutation: Partial<Document>
+    mutation: UpdateMutation
   ): Promise<Document> {
     return this.withCollectionLock(collection, async () => {
       const state = await this.loadCollection(collection);
@@ -244,19 +245,80 @@ class JsonFileDatabase implements Database {
         throw new Error(`Document '${id}' not found in collection '${collection}'`);
       }
 
-      const updated: Document = { ...existing, ...mutation, _id: id };
-      const normalized = await this.normalizeAndValidateDocument(
+      const patch = this.resolveUpdateMutation(mutation, existing);
+      const normalized = await this.applyUpdateMutation(
         collection,
-        updated,
-        false
+        state,
+        id,
+        existing,
+        patch
       );
-      await this.enforceUniqueConstraints(collection, normalized, state, id);
-      state.docs.set(id, normalized);
-      await this.appendLog(collection, state, { _id: id, data: normalized });
-      await this.refreshIndexesForWrite(collection, state, normalized, existing);
-      await this.applyBinaryRefChanges(normalized, existing);
       this.resetJoinCache();
-      return cloneDocument(normalized);
+      return normalized;
+    });
+  }
+
+  async updateWhere(
+    collection: string,
+    mutation: UpdateMutation,
+    filter: Filter = {},
+    options: UpdateWhereOptions = {}
+  ): Promise<Document[]> {
+    return this.withCollectionLock(collection, async () => {
+      const state = await this.loadCollection(collection);
+      const schema = await this.getCollectionSchema(collection);
+      const { limit = Infinity, skip = 0, sort } = options;
+      const sortKeys = sort ? Object.keys(sort) : [];
+      const candidates = await this.getIndexedCandidates(collection, filter, state);
+      const docsToScan = candidates
+        ? Array.from(candidates)
+            .map((id) => state.docs.get(id))
+            .filter(Boolean) as Document[]
+        : Array.from(state.docs.values());
+
+      let matches = docsToScan.filter((doc) =>
+        matchesFilter(doc, filter, schema, this.options.customTypes)
+      );
+
+      if (sortKeys.length > 0) {
+        matches = matches.sort((left, right) =>
+          compareDocuments(
+            left,
+            right,
+            sort as Record<string, 1 | -1>,
+            schema,
+            this.options.customTypes
+          )
+        );
+      }
+
+      const start = skip;
+      const end = Number.isFinite(limit) ? start + limit : matches.length;
+      const selection = matches.slice(start, Math.min(end, matches.length));
+      const updated: Document[] = [];
+
+      for (const doc of selection) {
+        const targetId = doc._id as DocumentId | undefined;
+        if (!targetId) {
+          continue;
+        }
+
+        const patch = this.resolveUpdateMutation(mutation, doc);
+        const next = await this.applyUpdateMutation(
+          collection,
+          state,
+          targetId,
+          doc,
+          patch
+        );
+        updated.push(next);
+      }
+
+      if (updated.length > 0) {
+        this.resetJoinCache();
+      }
+
+      return updated;
     });
   }
 
@@ -626,6 +688,35 @@ class JsonFileDatabase implements Database {
 
   clearJoinCache(): void {
     this.resetJoinCache();
+  }
+
+  private resolveUpdateMutation(
+    mutation: UpdateMutation,
+    existing: Document
+  ): Partial<Document> {
+    if (typeof mutation === 'function') {
+      const result = mutation(cloneDocument(existing));
+      return result ?? {};
+    }
+
+    return mutation ?? {};
+  }
+
+  private async applyUpdateMutation(
+    collection: string,
+    state: CollectionState,
+    id: DocumentId,
+    existing: Document,
+    mutation: Partial<Document>
+  ): Promise<Document> {
+    const updated: Document = { ...existing, ...mutation, _id: id };
+    const normalized = await this.normalizeAndValidateDocument(collection, updated, false);
+    await this.enforceUniqueConstraints(collection, normalized, state, id);
+    state.docs.set(id, normalized);
+    await this.appendLog(collection, state, { _id: id, data: normalized });
+    await this.refreshIndexesForWrite(collection, state, normalized, existing);
+    await this.applyBinaryRefChanges(normalized, existing);
+    return cloneDocument(normalized);
   }
 
   private async withCollectionLock<T>(
@@ -1869,10 +1960,10 @@ function normalizeManifest(manifest: Manifest): Manifest {
 }
 
 function ensureDirectories(options: ResolvedOptions): void {
-  fs.mkdirSync(options.dataDir, { recursive: true });
-  fs.mkdirSync(options.binaryDir, { recursive: true });
-  fs.mkdirSync(options.indexDir, { recursive: true });
-  fs.mkdirSync(options.logDir, { recursive: true });
+  mkdirSync(options.dataDir, { recursive: true });
+  mkdirSync(options.binaryDir, { recursive: true });
+  mkdirSync(options.indexDir, { recursive: true });
+  mkdirSync(options.logDir, { recursive: true });
 }
 
 async function appendFileWithSync(
@@ -2540,7 +2631,7 @@ async function* streamSnapshotDocs(filePath: string): AsyncGenerator<Document> {
     let arrayStarted = false;
     let braceDepth = 0;
     let objectStart = -1;
-    const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
+    const stream = createReadStream(filePath, { encoding: 'utf8' });
 
     for await (const chunk of stream) {
       buffer += chunk;
@@ -2648,7 +2739,7 @@ async function readSnapshot(filePath: string): Promise<Document[]> {
 async function readFileFromPosition(filePath: string, offset: number): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = '';
-    const stream = fs.createReadStream(filePath, {
+    const stream = createReadStream(filePath, {
       encoding: 'utf8',
       start: offset
     });
@@ -2677,7 +2768,7 @@ async function* streamLogEntries(
 ): AsyncGenerator<LogEntry> {
   try {
     let buffer = '';
-    const stream = fs.createReadStream(filePath, { encoding: 'utf8', start: offset });
+    const stream = createReadStream(filePath, { encoding: 'utf8', start: offset });
     for await (const chunk of stream) {
       buffer += chunk;
       let newlineIndex = buffer.indexOf('\n');
