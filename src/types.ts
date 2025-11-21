@@ -80,9 +80,39 @@ export interface CollectionSchema {
   fields: Record<string, FieldSchema>;
 }
 
-export interface Filter {
-  [key: string]: unknown;
+export type ComparableValue = string | number | boolean | null | Date;
+
+export interface FieldOperator {
+  $eq?: ComparableValue;
+  $ne?: ComparableValue;
+  $gt?: ComparableValue;
+  $gte?: ComparableValue;
+  $lt?: ComparableValue;
+  $lte?: ComparableValue;
+  $in?: ComparableValue[];
+  $nin?: ComparableValue[];
+  $between?: [ComparableValue, ComparableValue];
+  $like?: string;
+  $ilike?: string;
+  $exists?: boolean;
+  $isNull?: boolean;
+  $not?: FieldPredicate;
 }
+
+export type FieldPredicate = ComparableValue | ComparableValue[] | FieldOperator;
+
+export interface LogicalFilter {
+  $and?: Filter[];
+  $or?: Filter[];
+  $not?: Filter;
+}
+
+export type Filter = LogicalFilter &
+  Record<
+    string,
+    | FieldPredicate
+    | undefined
+  >;
 
 export interface FindOptions {
   limit?: number;

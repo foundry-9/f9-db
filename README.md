@@ -31,6 +31,7 @@ Quilltap’s future direction includes moving off Postgres, favoring a portable 
   - Options: `dataDir`, `binaryDir`, `log` (custom logger), `autoCompact`, `fsync` mode, tokenizer/index config, limits.
 - CRUD: `insert(collection, doc)`, `get(collection, id)`, `update(collection, id, mutation)`, `remove(collection, id)`.
 - Query: `find(collection, filter, opts)` (JSON result), `stream(collection, filter, opts)` (AsyncIterator yielding JSONL).
+  - Filters support SQL-style predicates: direct equality, `$gt/$gte/$lt/$lte`, `$between`, `$in/$nin`, `$like/$ilike`, `$isNull/$exists`, and boolean `$and/$or/$not`. Arrays remain shorthand for `IN`.
 - Index mgmt: `ensureIndex(collection, field, options)`, `rebuildIndex`.
 - Relations: `join(collection, doc, relations)` resolves foreign refs into nested objects/arrays with batching to avoid N+1. Cache size/TTL are configurable; call `clearJoinCache()` to flush manually.
 

@@ -86,6 +86,36 @@ describe('JsonFileDatabase', () => {
     expect(sorted.map((u) => u.name)).toEqual(['Ada', 'Bob']);
   });
 
+  test('find evaluates SQL-like predicates (comparisons, boolean logic, NULL)', async () => {
+    ({ dataDir, binaryDir, logDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    await db.insert('users', { name: 'Ada Lovelace', age: 35, city: 'London' });
+    await db.insert('users', { name: 'Bob', age: 40, city: null });
+    await db.insert('users', { name: 'carol', age: 28, city: 'Lisbon' });
+    await db.insert('users', { name: 'dave', age: 33, city: 'Denver' });
+    await db.insert('users', { name: 'Eve', age: 50, city: 'Boston' });
+
+    const matches = await db.find('users', {
+      $and: [
+        { age: { $between: [30, 40] } },
+        { $or: [{ name: { $like: 'A%' } }, { city: { $ilike: 'den%' } }] },
+        { $not: { city: { $isNull: true } } }
+      ]
+    });
+
+    expect(matches.map((user) => user.name).sort()).toEqual(['Ada Lovelace', 'dave']);
+
+    const nullCities = await db.find('users', { city: { $isNull: true } });
+    expect(nullCities.map((user) => user.name)).toEqual(['Bob']);
+
+    const notIn = await db.find('users', {
+      name: { $nin: ['Bob', 'Eve'] },
+      age: { $gt: 30 }
+    });
+    expect(notIn.map((user) => user.name).sort()).toEqual(['Ada Lovelace', 'dave']);
+  });
+
   test('stream yields JSONL strings respecting limit/skip', async () => {
     ({ dataDir, binaryDir, logDir } = createTempDirs());
     db = createDatabase({ dataDir, binaryDir });

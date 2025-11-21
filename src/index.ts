@@ -1236,11 +1236,12 @@ class JsonFileDatabase implements Database {
     let candidates: Set<DocumentId> | null = null;
     const usedFields: string[] = [];
 
-    for (const [field, expected] of Object.entries(filter)) {
-      if (expected === undefined) {
-        continue;
-      }
+    const indexable = extractIndexableFieldPredicates(filter);
+    if (!indexable) {
+      return null;
+    }
 
+    for (const { field, values } of indexable) {
       const metadata = indexEntries[field];
       if (!metadata || metadata.state !== 'ready' || metadata.checkpoint < logSize) {
         continue;
@@ -1251,14 +1252,9 @@ class JsonFileDatabase implements Database {
         continue;
       }
 
-      const expectedValues = Array.isArray(expected) ? expected : [expected];
       const perValueCandidates: Set<DocumentId>[] = [];
 
-      for (const value of expectedValues) {
-        if (typeof value !== 'string' && !Array.isArray(value)) {
-          continue;
-        }
-
+      for (const value of values) {
         const tokens = collectTokens(value, metadata.options);
         if (tokens.length === 0) {
           continue;
@@ -2569,18 +2565,282 @@ async function readLog(
 }
 
 function matchesFilter(doc: Document, filter: Filter): boolean {
-  return Object.entries(filter).every(([key, expected]) => {
-    if (expected === undefined) {
-      return true;
+  if (!filter || Object.keys(filter).length === 0) {
+    return true;
+  }
+
+  if (Array.isArray(filter.$and)) {
+    if (!filter.$and.every((sub) => matchesFilter(doc, sub))) {
+      return false;
+    }
+  }
+
+  if (Array.isArray(filter.$or)) {
+    if (!filter.$or.some((sub) => matchesFilter(doc, sub))) {
+      return false;
+    }
+  }
+
+  if (filter.$not && matchesFilter(doc, filter.$not)) {
+    return false;
+  }
+
+  for (const [key, predicate] of Object.entries(filter)) {
+    if (key === '$and' || key === '$or' || key === '$not') {
+      continue;
     }
 
-    const value = (doc as Record<string, unknown>)[key];
-    if (Array.isArray(expected)) {
-      return expected.includes(value);
+    const value = getValueAtPath(doc, key);
+    if (!matchesFieldPredicate(value, predicate)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function matchesFieldPredicate(value: unknown, predicate: unknown): boolean {
+  if (predicate === undefined) {
+    return true;
+  }
+
+  if (Array.isArray(predicate)) {
+    return predicate.some((expected) => valuesEqual(value, expected));
+  }
+
+  if (isPlainObject(predicate)) {
+    const ops = predicate as Record<string, unknown>;
+
+    if (ops.$not !== undefined && matchesFieldPredicate(value, ops.$not)) {
+      return false;
     }
 
-    return value === expected;
-  });
+    if (ops.$exists !== undefined) {
+      const exists = value !== undefined;
+      if (ops.$exists !== exists) {
+        return false;
+      }
+    }
+
+    if (ops.$isNull !== undefined) {
+      const isNullish = value === null || value === undefined;
+      if (ops.$isNull !== isNullish) {
+        return false;
+      }
+    }
+
+    if (ops.$eq !== undefined && !valuesEqual(value, ops.$eq)) {
+      return false;
+    }
+
+    if (ops.$ne !== undefined && valuesEqual(value, ops.$ne)) {
+      return false;
+    }
+
+    if (ops.$gt !== undefined && !compareWithOperator(value, ops.$gt, 'gt')) {
+      return false;
+    }
+
+    if (ops.$gte !== undefined && !compareWithOperator(value, ops.$gte, 'gte')) {
+      return false;
+    }
+
+    if (ops.$lt !== undefined && !compareWithOperator(value, ops.$lt, 'lt')) {
+      return false;
+    }
+
+    if (ops.$lte !== undefined && !compareWithOperator(value, ops.$lte, 'lte')) {
+      return false;
+    }
+
+    if (ops.$between !== undefined) {
+      const range = ops.$between;
+      if (
+        !Array.isArray(range) ||
+        range.length !== 2 ||
+        !compareWithOperator(value, range[0], 'gte') ||
+        !compareWithOperator(value, range[1], 'lte')
+      ) {
+        return false;
+      }
+    }
+
+    if (ops.$in !== undefined) {
+      if (
+        !Array.isArray(ops.$in) ||
+        !ops.$in.some((candidate) => valuesEqual(value, candidate))
+      ) {
+        return false;
+      }
+    }
+
+    if (ops.$nin !== undefined) {
+      if (
+        Array.isArray(ops.$nin) &&
+        ops.$nin.some((candidate) => valuesEqual(value, candidate))
+      ) {
+        return false;
+      }
+    }
+
+    if (ops.$like !== undefined) {
+      if (!matchesLike(value, ops.$like, false)) {
+        return false;
+      }
+    }
+
+    if (ops.$ilike !== undefined) {
+      if (!matchesLike(value, ops.$ilike, true)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  return valuesEqual(value, predicate);
+}
+
+function matchesLike(value: unknown, pattern: unknown, caseInsensitive: boolean): boolean {
+  if (typeof value !== 'string' || typeof pattern !== 'string') {
+    return false;
+  }
+
+  const regex = createLikeRegex(pattern, caseInsensitive);
+  return regex.test(value);
+}
+
+function createLikeRegex(pattern: string, caseInsensitive: boolean): RegExp {
+  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const regexBody = escaped.replace(/%/g, '.*').replace(/_/g, '.');
+  return new RegExp(`^${regexBody}$`, caseInsensitive ? 'i' : undefined);
+}
+
+function compareWithOperator(
+  value: unknown,
+  expected: unknown,
+  op: 'gt' | 'gte' | 'lt' | 'lte'
+): boolean {
+  const compare = compareValues(value, expected);
+  if (compare === null) {
+    return false;
+  }
+
+  if (op === 'gt') return compare > 0;
+  if (op === 'gte') return compare >= 0;
+  if (op === 'lt') return compare < 0;
+  if (op === 'lte') return compare <= 0;
+  return false;
+}
+
+function compareValues(left: unknown, right: unknown): number | null {
+  const normalizedLeft = normalizeComparable(left);
+  const normalizedRight = normalizeComparable(right);
+
+  if (normalizedLeft === undefined || normalizedRight === undefined) {
+    return null;
+  }
+
+  if (typeof normalizedLeft !== typeof normalizedRight) {
+    return null;
+  }
+
+  if (typeof normalizedLeft === 'number' && typeof normalizedRight === 'number') {
+    if (Number.isNaN(normalizedLeft) || Number.isNaN(normalizedRight)) {
+      return null;
+    }
+    if (normalizedLeft === normalizedRight) return 0;
+    return normalizedLeft < normalizedRight ? -1 : 1;
+  }
+
+  if (typeof normalizedLeft === 'string' && typeof normalizedRight === 'string') {
+    if (normalizedLeft === normalizedRight) return 0;
+    return normalizedLeft < normalizedRight ? -1 : 1;
+  }
+
+  if (typeof normalizedLeft === 'boolean' && typeof normalizedRight === 'boolean') {
+    if (normalizedLeft === normalizedRight) return 0;
+    return normalizedLeft === false ? -1 : 1;
+  }
+
+  return null;
+}
+
+function normalizeComparable(value: unknown): string | number | boolean | null | undefined {
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+
+  if (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    value === null
+  ) {
+    return value;
+  }
+
+  return undefined;
+}
+
+function valuesEqual(left: unknown, right: unknown): boolean {
+  if (left instanceof Date && right instanceof Date) {
+    return left.getTime() === right.getTime();
+  }
+
+  return Object.is(left, right);
+}
+
+function extractIndexableFieldPredicates(
+  filter: Filter
+): Array<{ field: string; values: string[] }> | null {
+  if (hasLogicalOperators(filter)) {
+    return null;
+  }
+
+  const predicates: Array<{ field: string; values: string[] }> = [];
+  for (const [field, predicate] of Object.entries(filter)) {
+    if (field.startsWith('$')) {
+      continue;
+    }
+    const values = toIndexableValues(predicate);
+    if (!values || values.length === 0) {
+      continue;
+    }
+
+    predicates.push({ field, values });
+  }
+
+  return predicates.length > 0 ? predicates : null;
+}
+
+function hasLogicalOperators(filter: Filter): boolean {
+  return Boolean(filter.$and?.length || filter.$or?.length || filter.$not);
+}
+
+function toIndexableValues(predicate: unknown): string[] | null {
+  if (predicate === undefined) {
+    return null;
+  }
+
+  if (Array.isArray(predicate)) {
+    return predicate.every((value) => typeof value === 'string')
+      ? (predicate as string[])
+      : null;
+  }
+
+  if (isPlainObject(predicate)) {
+    const ops = predicate as Record<string, unknown>;
+    if (typeof ops.$eq === 'string') {
+      return [ops.$eq];
+    }
+    if (Array.isArray(ops.$in) && ops.$in.every((value) => typeof value === 'string')) {
+      return ops.$in as string[];
+    }
+    return null;
+  }
+
+  return typeof predicate === 'string' ? [predicate] : null;
 }
 
 function compareDocuments(
