@@ -18,7 +18,11 @@ import type {
   NormalizedIndexOptions,
   TokenizerOptions,
   CollectionSchema,
-  FieldSchema
+  FieldSchema,
+  BinaryMetadata,
+  BinaryWriteOptions,
+  BinaryDeleteOptions,
+  BinaryReference
 } from './types.js';
 
 interface ResolvedOptions extends DatabaseOptions {
@@ -31,6 +35,7 @@ interface ResolvedOptions extends DatabaseOptions {
   schemas: Record<string, CollectionSchema>;
   joinCacheMaxEntries: number;
   joinCacheTTLms?: number;
+  dedupeBinaries: boolean;
 }
 
 interface CollectionState {
@@ -54,6 +59,15 @@ interface ManifestCollectionEntry {
 interface Manifest {
   manifestVersion: number;
   collections: Record<string, ManifestCollectionEntry | undefined>;
+  binaries?: Record<string, BinaryManifestEntry | undefined>;
+}
+
+interface BinaryManifestEntry {
+  size: number;
+  mimeType?: string;
+  createdAt: string;
+  updatedAt?: string;
+  refCount: number;
 }
 
 interface IndexFilePayload {
@@ -107,6 +121,7 @@ class JsonFileDatabase implements Database {
     state.docs.set(_id, normalized);
     await this.appendLog(collection, state, { _id, data: normalized });
     await this.refreshIndexesForWrite(collection, state, normalized, null);
+    await this.applyBinaryRefChanges(normalized, null);
     this.resetJoinCache();
     return cloneDocument(normalized);
   }
@@ -139,6 +154,7 @@ class JsonFileDatabase implements Database {
     state.docs.set(id, normalized);
     await this.appendLog(collection, state, { _id: id, data: normalized });
     await this.refreshIndexesForWrite(collection, state, normalized, existing);
+    await this.applyBinaryRefChanges(normalized, existing);
     this.resetJoinCache();
     return cloneDocument(normalized);
   }
@@ -154,6 +170,7 @@ class JsonFileDatabase implements Database {
     state.docs.delete(id);
     await this.appendLog(collection, state, { _id: id, tombstone: true });
     await this.refreshIndexesForWrite(collection, state, null, existing);
+    await this.applyBinaryRefChanges(null, existing);
     this.resetJoinCache();
   }
 
@@ -361,6 +378,93 @@ class JsonFileDatabase implements Database {
     this.resetJoinCache();
   }
 
+  async saveBinary(
+    data: Buffer | ArrayBuffer | Uint8Array | string,
+    options: BinaryWriteOptions = {}
+  ): Promise<BinaryMetadata> {
+    const buffer = normalizeBinaryInput(data);
+    const sha256 = hashBuffer(buffer);
+    const filePath = path.join(this.options.binaryDir, sha256);
+    const dedupe = options.dedupe ?? this.options.dedupeBinaries;
+    const exists = await fileExists(filePath);
+    const shouldWrite = !dedupe || !exists;
+
+    if (shouldWrite) {
+      await fsp.writeFile(filePath, buffer);
+    }
+
+    const now = new Date().toISOString();
+    const manifest = await this.getManifest();
+    const binaries = manifest.binaries ?? {};
+    const existing = binaries[sha256];
+    const entry: BinaryManifestEntry = {
+      size: buffer.length,
+      mimeType: options.mimeType ?? existing?.mimeType,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      refCount: existing?.refCount ?? 0
+    };
+    binaries[sha256] = entry;
+    manifest.binaries = binaries;
+    await this.persistManifest(manifest);
+
+    return {
+      sha256,
+      size: buffer.length,
+      mimeType: entry.mimeType,
+      path: filePath,
+      createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
+      refCount: entry.refCount,
+      deduped: !shouldWrite && exists
+    };
+  }
+
+  async readBinary(sha256: string): Promise<Buffer | null> {
+    const filePath = path.join(this.options.binaryDir, sha256);
+    try {
+      return await fsp.readFile(filePath);
+    } catch (error) {
+      if (isEnoentError(error)) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async deleteBinary(
+    sha256: string,
+    options: BinaryDeleteOptions = {}
+  ): Promise<boolean> {
+    const manifest = await this.getManifest();
+    const binaries = manifest.binaries ?? {};
+    const existing = binaries[sha256];
+
+    if (existing && existing.refCount > 0 && !options.force) {
+      throw new Error(
+        `Cannot delete binary '${sha256}' while refCount=${existing.refCount}`
+      );
+    }
+
+    const filePath = path.join(this.options.binaryDir, sha256);
+    try {
+      await fsp.unlink(filePath);
+    } catch (error) {
+      if (!isEnoentError(error)) {
+        throw error;
+      }
+    }
+
+    if (existing) {
+      delete binaries[sha256];
+      manifest.binaries = binaries;
+      await this.persistManifest(manifest);
+      return true;
+    }
+
+    return false;
+  }
+
   private async loadCollection(collection: string): Promise<CollectionState> {
     const existing = this.collections.get(collection);
     if (existing?.loaded) {
@@ -481,7 +585,7 @@ class JsonFileDatabase implements Database {
       this.manifest = normalizeManifest(parsed);
     } catch (error) {
       if (isEnoentError(error)) {
-        this.manifest = { manifestVersion: 1, collections: {} };
+        this.manifest = { manifestVersion: 1, collections: {}, binaries: {} };
       } else {
         throw error;
       }
@@ -818,6 +922,56 @@ class JsonFileDatabase implements Database {
     }
   }
 
+  private async applyBinaryRefChanges(
+    newDoc: Document | null,
+    previousDoc: Document | null
+  ): Promise<void> {
+    const nextRefs = countBinaryRefs(extractBinaryRefs(newDoc));
+    const prevRefs = countBinaryRefs(extractBinaryRefs(previousDoc));
+    const shas = new Set([...Object.keys(nextRefs), ...Object.keys(prevRefs)]);
+    if (shas.size === 0) {
+      return;
+    }
+
+    const manifest = await this.getManifest();
+    const binaries = { ...(manifest.binaries ?? {}) };
+    const now = new Date().toISOString();
+    let changed = false;
+
+    shas.forEach((sha) => {
+      const next = nextRefs[sha]?.count ?? 0;
+      const prev = prevRefs[sha]?.count ?? 0;
+      const delta = next - prev;
+      if (delta === 0) {
+        return;
+      }
+
+      const existing = binaries[sha];
+      if (delta < 0 && !existing) {
+        return;
+      }
+
+      const size = nextRefs[sha]?.size ?? existing?.size ?? 0;
+      const mimeType = nextRefs[sha]?.mimeType ?? existing?.mimeType;
+      const createdAt = existing?.createdAt ?? now;
+      const refCount = Math.max(0, (existing?.refCount ?? 0) + delta);
+
+      binaries[sha] = {
+        size,
+        mimeType,
+        createdAt,
+        updatedAt: now,
+        refCount
+      };
+      changed = true;
+    });
+
+    if (changed) {
+      manifest.binaries = binaries;
+      await this.persistManifest(manifest);
+    }
+  }
+
   private async getIndexedCandidates(
     collection: string,
     filter: Filter,
@@ -1018,7 +1172,8 @@ function resolveOptions(options: DatabaseOptions): ResolvedOptions {
     snapshotInterval: options.snapshotInterval ?? 100,
     logRetention: options.logRetention ?? 'truncate',
     joinCacheMaxEntries: options.joinCacheMaxEntries ?? 1000,
-    joinCacheTTLms: options.joinCacheTTLms
+    joinCacheTTLms: options.joinCacheTTLms,
+    dedupeBinaries: options.dedupeBinaries ?? true
   };
 }
 
@@ -1208,6 +1363,7 @@ function normalizeManifest(manifest: Manifest): Manifest {
   const manifestVersion =
     typeof manifest?.manifestVersion === 'number' ? manifest.manifestVersion : 1;
   const collections: Record<string, ManifestCollectionEntry | undefined> = {};
+  const binaries: Record<string, BinaryManifestEntry | undefined> = {};
 
   if (manifest && typeof manifest.collections === 'object') {
     Object.entries(manifest.collections).forEach(([name, entry]) => {
@@ -1231,7 +1387,24 @@ function normalizeManifest(manifest: Manifest): Manifest {
     });
   }
 
-  return { manifestVersion, collections };
+  if (manifest && typeof manifest.binaries === 'object') {
+    Object.entries(manifest.binaries).forEach(([sha, entry]) => {
+      if (!entry) {
+        binaries[sha] = undefined;
+        return;
+      }
+
+      binaries[sha] = {
+        size: typeof entry.size === 'number' ? entry.size : 0,
+        mimeType: typeof entry.mimeType === 'string' ? entry.mimeType : undefined,
+        createdAt: entry.createdAt ?? new Date(0).toISOString(),
+        updatedAt: entry.updatedAt,
+        refCount: typeof entry.refCount === 'number' ? entry.refCount : 0
+      };
+    });
+  }
+
+  return { manifestVersion, collections, binaries };
 }
 
 function ensureDirectories(options: ResolvedOptions): void {
@@ -1486,7 +1659,7 @@ function validateDocumentAgainstSchema(
 ): void {
   const record = doc as Record<string, unknown>;
   Object.keys(record).forEach((key) => {
-    if (key === '_id') {
+    if (key === '_id' || key === '_binRefs') {
       return;
     }
     if (!schema.fields[key]) {
@@ -1710,6 +1883,80 @@ function tokenizeString(
       (token) =>
         token.length >= tokenizer.minTokenLength && !stopwords.includes(token)
     );
+}
+
+function normalizeBinaryInput(
+  data: Buffer | ArrayBuffer | Uint8Array | string
+): Buffer {
+  if (Buffer.isBuffer(data)) {
+    return data;
+  }
+
+  if (typeof data === 'string') {
+    return Buffer.from(data);
+  }
+
+  if (data instanceof ArrayBuffer) {
+    return Buffer.from(data);
+  }
+
+  if (ArrayBuffer.isView(data)) {
+    return Buffer.from(data.buffer);
+  }
+
+  return Buffer.from([]);
+}
+
+function hashBuffer(buffer: Buffer): string {
+  const hash = crypto.createHash('sha256');
+  hash.update(buffer);
+  return hash.digest('hex');
+}
+
+function extractBinaryRefs(doc: Document | null): BinaryReference[] {
+  if (!doc) {
+    return [];
+  }
+
+  const refs = (doc as Document)._binRefs;
+  if (!Array.isArray(refs)) {
+    return [];
+  }
+
+  return refs.filter(isBinaryReference).map((ref) => ({
+    field: ref.field,
+    sha256: ref.sha256,
+    size: typeof ref.size === 'number' ? ref.size : undefined,
+    mimeType: typeof ref.mimeType === 'string' ? ref.mimeType : undefined
+  }));
+}
+
+function isBinaryReference(value: unknown): value is BinaryReference {
+  if (!isPlainObject(value)) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.field === 'string' && typeof candidate.sha256 === 'string';
+}
+
+function countBinaryRefs(
+  refs: BinaryReference[]
+): Record<string, { count: number; size?: number; mimeType?: string }> {
+  const counts: Record<string, { count: number; size?: number; mimeType?: string }> = {};
+
+  refs.forEach((ref) => {
+    const current = counts[ref.sha256] ?? { count: 0 };
+    current.count += 1;
+    if (current.size === undefined && ref.size !== undefined) {
+      current.size = ref.size;
+    }
+    if (current.mimeType === undefined && ref.mimeType !== undefined) {
+      current.mimeType = ref.mimeType;
+    }
+    counts[ref.sha256] = current;
+  });
+
+  return counts;
 }
 
 async function readSnapshot(filePath: string): Promise<Document[]> {

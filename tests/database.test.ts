@@ -584,4 +584,57 @@ describe('JsonFileDatabase', () => {
     });
     expect(refreshed.author).toEqual({ _id: alice._id, name: 'Alice final' });
   });
+
+  test('binary store writes hashed files, dedupes, and reads content', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    const saved = await db.saveBinary('hello', { mimeType: 'text/plain' });
+    const filePath = path.join(binaryDir, saved.sha256);
+    expect(fs.existsSync(filePath)).toBe(true);
+    expect(saved.deduped).toBe(false);
+
+    const deduped = await db.saveBinary('hello');
+    expect(deduped.sha256).toBe(saved.sha256);
+    expect(deduped.deduped).toBe(true);
+
+    const read = await db.readBinary(saved.sha256);
+    expect(read?.toString()).toBe('hello');
+
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(dataDir, 'manifest.json'), 'utf8')
+    );
+    expect(manifest.binaries[saved.sha256]).toMatchObject({
+      size: saved.size,
+      mimeType: 'text/plain',
+      refCount: 0
+    });
+  });
+
+  test('binary refs on documents update manifest counts and gate deletion', async () => {
+    ({ dataDir, binaryDir } = createTempDirs());
+    db = createDatabase({ dataDir, binaryDir });
+
+    const binary = await db.saveBinary(Buffer.from('payload'), { mimeType: 'application/octet-stream' });
+    const doc = await db.insert('files', {
+      name: 'file1',
+      _binRefs: [{ field: 'content', sha256: binary.sha256, size: binary.size, mimeType: binary.mimeType }]
+    });
+
+    let manifest = JSON.parse(fs.readFileSync(path.join(dataDir, 'manifest.json'), 'utf8'));
+    expect(manifest.binaries[binary.sha256].refCount).toBe(1);
+
+    await expect(db.deleteBinary(binary.sha256)).rejects.toThrow(/Cannot delete binary/);
+
+    await db.update('files', doc._id as string, {
+      _binRefs: []
+    });
+
+    manifest = JSON.parse(fs.readFileSync(path.join(dataDir, 'manifest.json'), 'utf8'));
+    expect(manifest.binaries[binary.sha256].refCount).toBe(0);
+
+    const removed = await db.deleteBinary(binary.sha256);
+    expect(removed).toBe(true);
+    expect(fs.existsSync(path.join(binaryDir, binary.sha256))).toBe(false);
+  });
 });

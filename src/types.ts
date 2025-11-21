@@ -10,6 +10,7 @@ export type JsonValue =
 
 export interface Document extends Record<string, unknown> {
   _id?: DocumentId;
+  _binRefs?: BinaryReference[];
 }
 
 export type FieldType =
@@ -141,6 +142,33 @@ export interface JoinRelation {
 
 export type JoinRelations = Record<string, JoinRelation | JoinRelation[]>;
 
+export interface BinaryReference {
+  field: string;
+  sha256: string;
+  size?: number;
+  mimeType?: string;
+}
+
+export interface BinaryMetadata {
+  sha256: string;
+  size: number;
+  mimeType?: string;
+  path: string;
+  createdAt: string;
+  updatedAt?: string;
+  refCount?: number;
+  deduped?: boolean;
+}
+
+export interface BinaryWriteOptions {
+  mimeType?: string;
+  dedupe?: boolean;
+}
+
+export interface BinaryDeleteOptions {
+  force?: boolean;
+}
+
 export interface Logger {
   debug?: (msg: string, context?: Record<string, unknown>) => void;
   info?: (msg: string, context?: Record<string, unknown>) => void;
@@ -161,6 +189,7 @@ export interface DatabaseOptions {
   schemas?: Record<string, CollectionSchema>;
   joinCacheMaxEntries?: number;
   joinCacheTTLms?: number;
+  dedupeBinaries?: boolean;
 }
 
 export interface Database {
@@ -195,4 +224,10 @@ export interface Database {
   ) => Promise<Document>;
   compact: (collection: string) => Promise<void>;
   clearJoinCache: () => void;
+  saveBinary: (
+    data: Buffer | ArrayBuffer | Uint8Array | string,
+    options?: BinaryWriteOptions
+  ) => Promise<BinaryMetadata>;
+  readBinary: (sha256: string) => Promise<Buffer | null>;
+  deleteBinary: (sha256: string, options?: BinaryDeleteOptions) => Promise<boolean>;
 }
